@@ -1,0 +1,9 @@
+{
+  "name": "fireclanker-alchemy-lambda-microvm-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prototype": "zsh -lic 'assume -x sandbox --exec \"env CI=1 ALCHEMY_TELEMETRY_DISABLED=1 AWS_ACCOUNT_ID=021891617269 AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 AWS_PAGER= bun run prototype:assumed\"'",
+    "prototype:assumed": "bun run run.ts"
+  }
+}

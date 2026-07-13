@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "paths": {
+      "alchemy": ["../../.agents/alchemy-effect/packages/alchemy/src/index.ts"],
+      "alchemy/*": ["../../.agents/alchemy-effect/packages/alchemy/src/*"],
+      "effect/*": ["../../.agents/alchemy-effect/node_modules/effect/src/*"],
+      "@effect/platform-node": [
+        "../../.agents/alchemy-effect/node_modules/@effect/platform-node/src/index.ts"
+      ],
+      "@effect/platform-node/*": [
+        "../../.agents/alchemy-effect/node_modules/@effect/platform-node/src/*"
+      ]
+    }
+  }
+}
