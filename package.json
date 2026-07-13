@@ -1,0 +1,13 @@
+{
+  "name": "fireclanker-planning",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prototype:cli": "bun run prototypes/cli-contract/fireclanker.ts",
+    "prototype:cli:build": "bun build prototypes/cli-contract/fireclanker.ts --compile --outfile prototypes/cli-contract/fireclanker-prototype"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "4.0.0-beta.98",
+    "effect": "4.0.0-beta.98"
+  }
+}
