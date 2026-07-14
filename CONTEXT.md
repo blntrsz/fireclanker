@@ -41,5 +41,5 @@ The durable, observable history of a Job, including agent messages, tool calls, 
 _Avoid_: Session content, logs, history
 
 **Job Status**:
-The lifecycle state of a Job: queued, running, succeeded, failed, or cancelled. A Job never pauses or waits for additional input.
+The lifecycle state of a Job: queued, running, succeeded, failed, or cancelled. `queued` means the Job has been durably accepted but execution has not yet been confirmed. `running` begins when execution is confirmed and includes runtime initialization before agent work begins. A Job never pauses or waits for additional input.
 _Avoid_: State, phase
