@@ -6,16 +6,27 @@ import {
   PublishVersionCommand,
   UpdateAliasCommand,
 } from "@aws-sdk/client-lambda";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { PutSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
-import * as Alchemy from "alchemy";
 import * as AWS from "alchemy/AWS";
+import { Assets } from "alchemy/AWS";
+import * as Plan from "alchemy/Plan";
+import { evalStack, Stack } from "alchemy/Stack";
+import { inMemoryState } from "alchemy/State/InMemoryState";
+import { localState } from "alchemy/State/LocalState";
 import * as Test from "alchemy/Test/Core";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DeploymentConfiguration, DeploymentIdentity } from "../domain/deployment.js";
+
+export interface AmbientCredentials {
+  readonly accessKeyId: string;
+  readonly secretAccessKey: string;
+  readonly sessionToken?: string;
+}
 
 const controlHandler = `
 export const handler = async (event: unknown) => ({
@@ -92,6 +103,7 @@ const lambdaTrust: AWS.IAM.PolicyDocument = {
 const createStack = (
   configuration: DeploymentConfiguration,
   identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
   assets: Awaited<ReturnType<typeof prepareEmbeddedAssets>>,
 ) => {
   const bootstrapBucket = bootstrapBucketName(identity);
@@ -99,11 +111,11 @@ const createStack = (
   const secretName = githubSecretName(identity);
   const prefix = `deployments/${identity.name}`;
 
-  return Alchemy.Stack(
+  return Stack(
     `Fireclanker-${identity.name}`,
     {
-      providers: AWS.providers(),
-      state: AWS.state({ bucketName: bootstrapBucket, prefix }),
+      providers: namedProviders(identity, credentials),
+      state: AWS.state({ bucketName: bootstrapBucket, prefix: `${prefix}/` }),
     },
     Effect.gen(function* () {
       yield* AWS.S3.Bucket("Data", {
@@ -146,7 +158,7 @@ const createStack = (
           assets: {
             Version: "2012-10-17",
             Statement: [
-              { Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${bootstrapBucket}/*`] },
+              { Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${bootstrapBucket}/${prefix}/assets/*`] },
               { Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: [`arn:aws:logs:${identity.region}:${identity.accountId}:log-group:/fireclanker/${identity.name}/build:*`] },
             ],
           },
@@ -208,15 +220,86 @@ const createStack = (
   );
 };
 
-const withExplicitAccount = async <A>(identity: DeploymentIdentity, run: () => Promise<A>) => {
+const namedAssets = (identity: DeploymentIdentity, credentials: AmbientCredentials) => {
+  const bucketName = bootstrapBucketName(identity);
+  const key = (hash: string) => `deployments/${identity.name}/assets/lambda/${hash}.zip`;
+  const client = new S3Client({ region: identity.region, credentials });
+  return Layer.succeed(Assets, {
+    bucketName: Effect.succeed(bucketName),
+    uploadAsset: (hash: string, content: Uint8Array) =>
+      Effect.tryPromise({
+        try: async () => {
+          const assetKey = key(hash);
+          try {
+            await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: assetKey }));
+          } catch (error) {
+            if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode !== 404) {
+              throw error;
+            }
+            await client.send(
+              new PutObjectCommand({
+                Bucket: bucketName,
+                Key: assetKey,
+                Body: content,
+                ContentType: "application/zip",
+              }),
+            );
+          }
+          return assetKey;
+        },
+        catch: (cause) => ({
+          _tag: "AssetsUploadError" as const,
+          message: `Failed to upload deployment asset ${hash}`,
+          cause,
+        }),
+      }),
+    hasAsset: (hash: string) =>
+      Effect.tryPromise({
+        try: async () => {
+          try {
+            await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key(hash) }));
+            return true;
+          } catch (error) {
+            if ((error as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) {
+              return false;
+            }
+            throw error;
+          }
+        },
+        catch: (cause) => ({
+          _tag: "AssetsCheckError" as const,
+          message: `Failed to check deployment asset ${hash}`,
+          cause,
+        }),
+      }),
+  });
+};
+
+const namedProviders = (identity: DeploymentIdentity, credentials: AmbientCredentials) =>
+  Layer.merge(AWS.providers(), namedAssets(identity, credentials));
+
+const withExplicitAccount = async <A>(
+  identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
+  run: () => Promise<A>,
+) => {
   const previous = {
     account: process.env.AWS_ACCOUNT_ID,
     region: process.env.AWS_REGION,
     defaultRegion: process.env.AWS_DEFAULT_REGION,
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    sessionToken: process.env.AWS_SESSION_TOKEN,
+    ci: process.env.CI,
   };
   process.env.AWS_ACCOUNT_ID = identity.accountId;
   process.env.AWS_REGION = identity.region;
   process.env.AWS_DEFAULT_REGION = identity.region;
+  process.env.AWS_ACCESS_KEY_ID = credentials.accessKeyId;
+  process.env.AWS_SECRET_ACCESS_KEY = credentials.secretAccessKey;
+  if (credentials.sessionToken === undefined) delete process.env.AWS_SESSION_TOKEN;
+  else process.env.AWS_SESSION_TOKEN = credentials.sessionToken;
+  process.env.CI = "1";
   try {
     return await run();
   } finally {
@@ -226,34 +309,132 @@ const withExplicitAccount = async <A>(identity: DeploymentIdentity, run: () => P
     else process.env.AWS_REGION = previous.region;
     if (previous.defaultRegion === undefined) delete process.env.AWS_DEFAULT_REGION;
     else process.env.AWS_DEFAULT_REGION = previous.defaultRegion;
+    if (previous.accessKeyId === undefined) delete process.env.AWS_ACCESS_KEY_ID;
+    else process.env.AWS_ACCESS_KEY_ID = previous.accessKeyId;
+    if (previous.secretAccessKey === undefined) delete process.env.AWS_SECRET_ACCESS_KEY;
+    else process.env.AWS_SECRET_ACCESS_KEY = previous.secretAccessKey;
+    if (previous.sessionToken === undefined) delete process.env.AWS_SESSION_TOKEN;
+    else process.env.AWS_SESSION_TOKEN = previous.sessionToken;
+    if (previous.ci === undefined) delete process.env.CI;
+    else process.env.CI = previous.ci;
   }
 };
 
-const options = (identity: DeploymentIdentity) => ({
-  providers: AWS.providers(),
-  state: AWS.state({
+const options = (
+  identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
+  state: NonNullable<Test.MakeOptions["state"]> = AWS.state({
     bucketName: bootstrapBucketName(identity),
-    prefix: `deployments/${identity.name}`,
+    prefix: `deployments/${identity.name}/`,
   }),
-  profile: "default",
+) => ({
+  providers: namedProviders(identity, credentials),
+  state,
   stage: "live",
+  // Select a profile that can only correspond to the credentials resolved for
+  // this invocation. In CI mode Alchemy configures a missing profile from the
+  // explicit environment values installed by withExplicitAccount.
+  profile: `fireclanker-ambient-${new Bun.CryptoHasher("sha256")
+    .update(identity.accountId)
+    .update(identity.region)
+    .update(credentials.accessKeyId)
+    .update(credentials.secretAccessKey)
+    .update(credentials.sessionToken ?? "")
+    .digest("hex")
+    .slice(0, 16)}`,
+});
+
+export interface AlchemyPlanSummary {
+  readonly action: "create" | "update" | "no-op" | "delete";
+  readonly resources: ReadonlyArray<string>;
+  readonly controlRoleName?: string;
+}
+
+export const planAlchemyStack = async (
+  operation: "deploy" | "destroy",
+  configuration: DeploymentConfiguration,
+  identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
+  bootstrapExists: boolean,
+): Promise<AlchemyPlanSummary> =>
+  withExplicitAccount(identity, credentials, async () => {
+    const assets = await prepareEmbeddedAssets(configuration);
+    const coreOptions = options(
+      identity,
+      credentials,
+      bootstrapExists ? undefined : inMemoryState(),
+    );
+    const stack = createStack(configuration, identity, credentials, assets);
+    const effect = evalStack(
+      stack,
+      (compiled) =>
+        Plan.make(
+          (operation === "destroy"
+            ? { ...compiled, resources: {}, bindings: {}, actions: {}, output: {} }
+            : compiled) as any,
+        ),
+      { stage: coreOptions.stage },
+    );
+    const plan = await Test.run(effect, coreOptions);
+    const nodes = [
+      ...Object.entries(plan.resources),
+      ...Object.entries(plan.deletions).filter(
+        (entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined,
+      ),
+    ];
+    const resources = nodes.map(
+      ([fqn, node]) => `${node.action} ${node.resource.Type} ${fqn}`,
+    );
+    const actions = nodes.map(([, node]) => node.action);
+    const controlNode = nodes.find(([, node]) => node.resource.Type === "AWS.Lambda.Function")?.[1];
+    const controlRoleName = (controlNode?.state as { attr?: { roleName?: string } } | undefined)?.attr
+      ?.roleName;
+    const action =
+      operation === "destroy"
+        ? actions.includes("delete")
+          ? "delete"
+          : "no-op"
+        : actions.includes("create")
+          ? "create"
+          : actions.some((action) => action === "update" || action === "replace")
+            ? "update"
+            : "no-op";
+    return {
+      action,
+      resources: [
+        ...(bootstrapExists ? [] : [`create AWS.S3.Bucket ${bootstrapBucketName(identity)}`]),
+        ...resources,
+      ],
+      ...(controlRoleName === undefined ? {} : { controlRoleName }),
+    };
+  });
+
+export const controlPolicyDocument = (identity: DeploymentIdentity) => ({
+  Version: "2012-10-17",
+  Statement: [
+    { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"], Resource: [`arn:aws:s3:::${dataBucketName(identity)}`, `arn:aws:s3:::${dataBucketName(identity)}/jobs/*`, `arn:aws:s3:::${dataBucketName(identity)}/runtime-configuration.json`] },
+    { Effect: "Allow", Action: ["lambda:InvokeFunction"], Resource: [`arn:aws:lambda:${identity.region}:${identity.accountId}:function:fireclanker-${identity.name}-control:live`] },
+    { Effect: "Allow", Action: ["iam:PassRole"], Resource: [`arn:aws:iam::${identity.accountId}:role/fireclanker-${identity.name}-runner`] },
+    { Effect: "Allow", Action: ["lambda:RunMicrovm", "lambda:GetMicrovm", "lambda:TerminateMicrovm"], Resource: ["*"] },
+  ],
 });
 
 export const applyAlchemyStack = async (
   configuration: DeploymentConfiguration,
   identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
   githubToken: string | undefined,
 ) =>
-  withExplicitAccount(identity, async () => {
+  withExplicitAccount(identity, credentials, async () => {
     const assets = await prepareEmbeddedAssets(configuration);
-    const coreOptions = options(identity);
-    const bootstrapOptions = { ...coreOptions, state: Alchemy.localState() };
+    const coreOptions = options(identity, credentials);
+    const bootstrapOptions = { ...coreOptions, state: localState() };
     await Test.run(
       Test.withProviders(AWS.bootstrap(), bootstrapOptions, `Bootstrap-${identity.name}`),
       bootstrapOptions,
     );
     const output = await Test.run(
-      Test.deploy(coreOptions, createStack(configuration, identity, assets)),
+      Test.deploy(coreOptions, createStack(configuration, identity, credentials, assets)),
       coreOptions,
     );
 
@@ -276,15 +457,7 @@ export const applyAlchemyStack = async (
       new PutRolePolicyCommand({
         RoleName: output.controlRoleName,
         PolicyName: "fireclanker-control",
-        PolicyDocument: JSON.stringify({
-          Version: "2012-10-17",
-          Statement: [
-            { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:DeleteObject"], Resource: [`arn:aws:s3:::${dataBucketName(identity)}`, `arn:aws:s3:::${dataBucketName(identity)}/jobs/*`, `arn:aws:s3:::${dataBucketName(identity)}/runtime-configuration.json`] },
-            { Effect: "Allow", Action: ["lambda:InvokeFunction"], Resource: [`arn:aws:lambda:${region}:${identity.accountId}:function:${output.controlFunctionName}:live`] },
-            { Effect: "Allow", Action: ["iam:PassRole"], Resource: [`arn:aws:iam::${identity.accountId}:role/fireclanker-${identity.name}-runner`] },
-            { Effect: "Allow", Action: ["lambda:RunMicrovm", "lambda:GetMicrovm", "lambda:TerminateMicrovm"], Resource: ["*"] },
-          ],
-        }),
+        PolicyDocument: JSON.stringify(controlPolicyDocument(identity)),
       }),
     );
 
@@ -302,15 +475,22 @@ export const applyAlchemyStack = async (
 export const destroyAlchemyStack = async (
   configuration: DeploymentConfiguration,
   identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
 ) =>
-  withExplicitAccount(identity, async () => {
+  withExplicitAccount(identity, credentials, async () => {
     const assets = await prepareEmbeddedAssets(configuration);
-    const coreOptions = options(identity);
-    await Test.run(Test.destroy(coreOptions, createStack(configuration, identity, assets)), coreOptions);
+    const coreOptions = options(identity, credentials);
+    await Test.run(
+      Test.destroy(coreOptions, createStack(configuration, identity, credentials, assets)),
+      coreOptions,
+    );
   });
 
-export const verifyAlchemyControlAlias = async (identity: DeploymentIdentity) => {
-  const alias = await new LambdaClient({ region: identity.region }).send(
+export const verifyAlchemyControlAlias = async (
+  identity: DeploymentIdentity,
+  credentials: AmbientCredentials,
+) => {
+  const alias = await new LambdaClient({ region: identity.region, credentials }).send(
     new GetAliasCommand({ FunctionName: `fireclanker-${identity.name}-control`, Name: "live" }),
   );
   if (alias.Name !== "live" || alias.FunctionVersion === undefined) {

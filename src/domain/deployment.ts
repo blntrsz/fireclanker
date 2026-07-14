@@ -37,6 +37,30 @@ export interface DeploymentPlan {
   readonly alchemyRevision: typeof ALCHEMY_SOURCE_REVISION;
 }
 
+export const deriveDeploymentPlan = ({
+  configurationMatches,
+  exists,
+  operation,
+  rotateGitHubToken,
+}: {
+  readonly configurationMatches: boolean;
+  readonly exists: boolean;
+  readonly operation: "deploy" | "destroy";
+  readonly rotateGitHubToken: boolean;
+}): Pick<DeploymentPlan, "action" | "requiresGitHubToken"> => ({
+  action:
+    operation === "destroy"
+      ? exists
+        ? "delete"
+        : "no-op"
+      : !exists
+        ? "create"
+        : configurationMatches && !rotateGitHubToken
+          ? "no-op"
+          : "update",
+  requiresGitHubToken: operation === "deploy" && (!exists || rotateGitHubToken),
+});
+
 export const deploymentKey = (identity: DeploymentIdentity) =>
   `${identity.accountId}/${identity.region}/${identity.name}`;
 

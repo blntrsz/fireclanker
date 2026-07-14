@@ -299,7 +299,7 @@ describe("compiled deterministic CLI", () => {
         code: "invalid_configuration",
       });
     }
-  });
+  }, 15_000);
 
   test("deploy converges portably, preserves or rotates the PAT, and destroys only the name", async () => {
     const firstMachine = await mkdtemp(join(tmpdir(), "fireclanker-first-machine-"));

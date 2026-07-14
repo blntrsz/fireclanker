@@ -13,6 +13,7 @@ import {
   ALCHEMY_SOURCE_REVISION,
   deploymentKey,
   deploymentResources,
+  deriveDeploymentPlan,
   type DeploymentConfiguration,
   type DeploymentIdentity,
 } from "../domain/deployment.js";
@@ -246,25 +247,20 @@ export const DeterministicDeploymentCore = Layer.effect(
         try: async () => {
           const state = await readDeploymentState();
           const existing = state[deploymentKey(identity)];
-          const action =
-            operation === "destroy"
-              ? existing === undefined
-                ? "no-op"
-                : "delete"
-              : existing === undefined
-                ? "create"
-                : sameConfiguration(existing.configuration, configuration) && !rotateGitHubToken
-                  ? "no-op"
-                  : "update";
+          const derived = deriveDeploymentPlan({
+            operation,
+            exists: existing !== undefined,
+            configurationMatches:
+              existing !== undefined && sameConfiguration(existing.configuration, configuration),
+            rotateGitHubToken,
+          });
           return {
             operation,
-            action,
+            ...derived,
             identity,
             bootstrapBucket: `alchemy-assets-${identity.accountId}-${identity.region}-an`,
             statePrefix: `deployments/${identity.name}/`,
             resources: deploymentResources(identity.name),
-            requiresGitHubToken:
-              operation === "deploy" && (existing === undefined || rotateGitHubToken),
             alchemyRevision: ALCHEMY_SOURCE_REVISION,
           } as const;
         },

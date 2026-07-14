@@ -10,6 +10,7 @@
         "@aws-sdk/client-s3": "3.1087.0",
         "@aws-sdk/client-secrets-manager": "3.1087.0",
         "@aws-sdk/client-sts": "3.1087.0",
+        "@aws-sdk/credential-provider-node": "3.972.68",
         "@effect/platform-bun": "4.0.0-beta.98",
         "@effect/platform-node": "4.0.0-beta.98",
         "@effect/platform-node-shared": "4.0.0-beta.98",
