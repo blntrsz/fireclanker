@@ -4,6 +4,9 @@ Fireclanker is an autonomous agent service that accepts delegated work and retur
 
 ## Language
 
+**Deployment**:
+A named Fireclanker installation in one AWS account and Region. Its identity is the account, Region, and configured name; its current configuration applies deployment-wide.
+
 **Job**:
 A durable unit of work submitted to Fireclanker, containing an instruction and a Repository Set. A Job produces an Outcome and retains its interaction history.
 _Avoid_: Task, request, assignment
