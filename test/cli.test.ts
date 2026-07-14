@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,35 @@ const invoke = (arguments_: ReadonlyArray<string>) =>
     stdout: "pipe",
     stderr: "pipe",
   });
+
+const invokeDeployment = (
+  arguments_: ReadonlyArray<string>,
+  cwd: string,
+  home: string,
+  stdin?: string,
+) =>
+  Bun.spawnSync([executable, ...arguments_], {
+    cwd,
+    env: {
+      ...process.env,
+      HOME: home,
+      XDG_CONFIG_HOME: join(home, ".config"),
+      FIRECLANKER_TEST_STATE_DIRECTORY: stateDirectory,
+    },
+    stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+const configuration = (name: string, overrides: Record<string, unknown> = {}) => ({
+  version: 1,
+  name,
+  region: "us-east-1",
+  model: "gpt-5.5",
+  repositoryCatalog: ["openai/example"],
+  retentionDays: 30,
+  ...overrides,
+});
 
 const invokeProduction = (arguments_: ReadonlyArray<string>) =>
   Bun.spawnSync([productionExecutable, ...arguments_], {
@@ -200,5 +229,138 @@ describe("compiled deterministic CLI", () => {
       code: "invalid_usage",
       message: "Use exactly one instruction source: positional text or --file",
     });
+  });
+
+  test("deploy discovers and strictly validates configuration before AWS activity", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "fireclanker-config-cwd-"));
+    const home = await mkdtemp(join(tmpdir(), "fireclanker-config-home-"));
+    const explicit = join(cwd, "explicit.json");
+    const userConfiguration = join(home, ".config", "fireclanker", "fireclanker.json");
+    await mkdir(join(home, ".config", "fireclanker"), { recursive: true });
+    await Bun.write(explicit, JSON.stringify(configuration("explicit")));
+    await Bun.write(join(cwd, "fireclanker.json"), JSON.stringify(configuration("working")));
+    await Bun.write(userConfiguration, JSON.stringify(configuration("user")));
+
+    const fromExplicit = invokeDeployment(
+      ["--json", "--config", explicit, "deploy"],
+      cwd,
+      home,
+    );
+    expect(fromExplicit.exitCode).toBe(2);
+    expect(JSON.parse(fromExplicit.stderr.toString())).toMatchObject({
+      code: "confirmation_required",
+      message: expect.stringContaining("explicit"),
+    });
+
+    const fromWorkingDirectory = invokeDeployment(["--json", "deploy"], cwd, home);
+    expect(fromWorkingDirectory.exitCode).toBe(2);
+    expect(JSON.parse(fromWorkingDirectory.stderr.toString())).toMatchObject({
+      code: "confirmation_required",
+      message: expect.stringContaining("working"),
+    });
+
+    await rm(join(cwd, "fireclanker.json"));
+    const fromUserConfiguration = invokeDeployment(["--json", "deploy"], cwd, home);
+    expect(fromUserConfiguration.exitCode).toBe(2);
+    expect(JSON.parse(fromUserConfiguration.stderr.toString())).toMatchObject({
+      code: "confirmation_required",
+      message: expect.stringContaining("user"),
+    });
+
+    await Bun.write(
+      explicit,
+      JSON.stringify(configuration("invalid", { unexpected: "rejected" })),
+    );
+    const invalid = invokeDeployment(
+      ["--json", "--config", explicit, "deploy", "--yes"],
+      cwd,
+      home,
+      "secret-that-must-not-be-read",
+    );
+    expect(invalid.exitCode).toBe(2);
+    expect(invalid.stdout.toString()).toBe("");
+    expect(JSON.parse(invalid.stderr.toString())).toMatchObject({ code: "invalid_configuration" });
+
+    for (const invalidFields of [
+      { region: "eu-central-1" },
+      { model: "unmapped-model" },
+      { retentionDays: 0 },
+      { repositoryCatalog: ["openai/example", "effect-ts/example"] },
+      { repositoryCatalog: ["openai/example", "OPENAI/EXAMPLE"] },
+    ]) {
+      await Bun.write(explicit, JSON.stringify(configuration("invalid", invalidFields)));
+      const rejected = invokeDeployment(
+        ["--json", "--config", explicit, "deploy", "--yes"],
+        cwd,
+        home,
+      );
+      expect(rejected.exitCode).toBe(2);
+      expect(JSON.parse(rejected.stderr.toString())).toMatchObject({
+        code: "invalid_configuration",
+      });
+    }
+  });
+
+  test("deploy converges portably, preserves or rotates the PAT, and destroys only the name", async () => {
+    const firstMachine = await mkdtemp(join(tmpdir(), "fireclanker-first-machine-"));
+    const secondMachine = await mkdtemp(join(tmpdir(), "fireclanker-second-machine-"));
+    const home = await mkdtemp(join(tmpdir(), "fireclanker-deployment-home-"));
+    const name = `portable-${Date.now().toString(36)}`;
+    const token = "github_pat_must_never_appear";
+    await Bun.write(join(firstMachine, "fireclanker.json"), JSON.stringify(configuration(name)));
+    await Bun.write(join(secondMachine, "fireclanker.json"), JSON.stringify(configuration(name)));
+
+    const created = invokeDeployment(
+      ["--json", "deploy", "--yes", "--github-token-stdin"],
+      firstMachine,
+      home,
+      `${token}\n`,
+    );
+    expect(created.exitCode, created.stderr.toString()).toBe(0);
+    expect(created.stderr.toString()).toBe("");
+    const createPlan = JSON.parse(created.stdout.toString());
+    expect(createPlan).toMatchObject({
+      event: "deployment-plan",
+      action: "create",
+      deployment: { accountId: "123456789012", region: "us-east-1", name },
+      statePrefix: `deployments/${name}/`,
+      alchemyRevision: "c999680eedb38aa1e311c65d8dd9ef67c785b9b8",
+    });
+    expect(created.stdout.toString()).not.toContain(token);
+
+    const convergedElsewhere = invokeDeployment(
+      ["--json", "deploy", "--yes"],
+      secondMachine,
+      home,
+    );
+    expect(convergedElsewhere.exitCode, convergedElsewhere.stderr.toString()).toBe(0);
+    expect(JSON.parse(convergedElsewhere.stdout.toString())).toMatchObject({ action: "no-op" });
+
+    const rotatedToken = "github_pat_rotated_must_never_appear";
+    const rotated = invokeDeployment(
+      ["--json", "deploy", "--yes", "--github-token-stdin"],
+      secondMachine,
+      home,
+      `${rotatedToken}\n`,
+    );
+    expect(rotated.exitCode, rotated.stderr.toString()).toBe(0);
+    expect(JSON.parse(rotated.stdout.toString())).toMatchObject({ action: "update" });
+    expect(rotated.stdout.toString()).not.toContain(rotatedToken);
+
+    const destroyed = invokeDeployment(["destroy", "--yes"], secondMachine, home);
+    expect(destroyed.exitCode, destroyed.stderr.toString()).toBe(0);
+    expect(destroyed.stdout.toString()).toContain(`Destroyed Deployment ${name}`);
+    expect(destroyed.stdout.toString()).toContain("Preserve shared bootstrap bucket");
+
+    const needsTokenAgain = invokeDeployment(["--json", "deploy", "--yes"], firstMachine, home);
+    expect(needsTokenAgain.exitCode).toBe(2);
+    expect(JSON.parse(needsTokenAgain.stderr.toString())).toMatchObject({
+      code: "github_token_required",
+      message: expect.stringContaining("GitHub token"),
+    });
+
+    const persistedState = await Bun.file(join(stateDirectory, "deployments.json")).text();
+    expect(persistedState).not.toContain(token);
+    expect(persistedState).not.toContain(rotatedToken);
   });
 });
