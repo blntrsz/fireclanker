@@ -1,0 +1,25 @@
+{
+  "name": "fireclanker",
+  "version": "0.0.1",
+  "private": true,
+  "bin": {
+    "fireclanker": "dist/fireclanker"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "bun run build:production",
+    "build:production": "bun build src/main.ts --compile --minify --define FIRECLANKER_COMPOSITION='\"production\"' --outfile dist/fireclanker",
+    "build:test": "bun build src/main.ts --compile --define FIRECLANKER_COMPOSITION='\"test\"' --outfile dist/fireclanker-test",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "4.0.0-beta.85",
+    "@effect/platform-node-shared": "4.0.0-beta.85",
+    "effect": "4.0.0-beta.85"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.5",
+    "typescript": "5.9.3"
+  }
+}
