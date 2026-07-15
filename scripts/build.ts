@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const composition = process.argv[2];
@@ -18,29 +17,6 @@ if (!controlHandlerBuild.success || controlHandlerBuild.outputs[0] === undefined
   throw new Error("Unable to build the embedded Control Lambda handler");
 }
 const controlHandler = await controlHandlerBuild.outputs[0].text();
-const alchemySource = resolve(root, ".agents", "alchemy-effect", "packages", "alchemy", "src");
-const expectedAlchemyRevision = "c999680eedb38aa1e311c65d8dd9ef67c785b9b8";
-const alchemyCheckout = resolve(alchemySource, "..", "..", "..");
-const revision = Bun.spawnSync(["git", "-C", alchemyCheckout, "rev-parse", "HEAD"], {
-  stdout: "pipe",
-  stderr: "pipe",
-});
-if (revision.exitCode !== 0 || revision.stdout.toString().trim() !== expectedAlchemyRevision) {
-  throw new Error(
-    `Alchemy source must be initialized at ${expectedAlchemyRevision}; run git submodule update --init`,
-  );
-}
-const exactAlchemyModule = (specifier: string) => {
-  if (specifier === "alchemy") return resolve(alchemySource, "index.ts");
-  const relative = specifier.slice("alchemy/".length);
-  const candidates = [
-    resolve(alchemySource, `${relative}.ts`),
-    resolve(alchemySource, relative, "index.ts"),
-  ];
-  const resolved = candidates.find(existsSync);
-  if (resolved === undefined) throw new Error(`Unable to resolve exact Alchemy module ${specifier}`);
-  return resolved;
-};
 
 const rolldownNativePackages: Record<string, string> = {
   "darwin-arm64": "@rolldown/binding-darwin-arm64",
@@ -69,7 +45,7 @@ const result = await Bun.build({
   },
   plugins: [
     {
-      name: "exact-alchemy-source-revision",
+      name: "embed-rolldown-native-binding",
       setup(builder) {
         builder.onLoad(
           { filter: /rolldown\/dist\/shared\/binding-.*\.mjs$/ },
@@ -94,9 +70,6 @@ const result = await Bun.build({
             };
           },
         );
-        builder.onResolve({ filter: /^alchemy(?:\/.*)?$/ }, (args) => ({
-          path: exactAlchemyModule(args.path),
-        }));
       },
     },
   ],
