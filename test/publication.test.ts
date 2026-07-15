@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import {
   publishPublicationPlan,
+  publishSafeRepository,
   type RepositoryPublisher,
+  type SafeRepositoryPublisher,
 } from "../src/application/publication.js";
 import { ManifestPersistenceError } from "../src/application/services.js";
 import {
@@ -225,5 +227,188 @@ describe("Repository Target publication decisions", () => {
         state,
       ),
     ).toBeInstanceOf(InvalidRepositoryTarget);
+  });
+});
+
+const safeEntry = plan.repositories[0]!;
+
+const safePublisher = (overrides: Partial<SafeRepositoryPublisher> = {}): SafeRepositoryPublisher => ({
+  rebase: () => Effect.succeed({ kind: "clean", baseSha: "base-1", expectedHeadSha: "head-1" }),
+  resolveConflict: () => Effect.succeed({ kind: "conflict", baseSha: "base-1", message: "still conflicted" }),
+  write: (prepared, entry) => Effect.succeed({
+    kind: "success",
+    pullRequest: {
+      repository: entry.repository,
+      number: 101,
+      title: entry.pullRequest.title,
+      url: `https://github.com/${entry.repository}/pull/101`,
+      draft: true,
+      action: "created",
+    },
+  }),
+  reconcile: () => Effect.succeed({ expectedHeadPresent: false }),
+  ...overrides,
+});
+
+describe("safe repository publication", () => {
+  test("rebases onto the latest target before writing deterministic branch and pull request identity", async () => {
+    const observed: string[] = [];
+    const result = await Effect.runPromise(publishSafeRepository(safeEntry, 0, safePublisher({
+      rebase: () => {
+        observed.push("rebase");
+        return Effect.succeed({ kind: "clean", baseSha: "base-latest", expectedHeadSha: "head-after-rebase" });
+      },
+      write: (prepared, entry) => {
+        observed.push(`write:${prepared.baseSha}:${prepared.expectedHeadSha}:${prepared.deterministicBranch}`);
+        return Effect.succeed({
+          kind: "success",
+          pullRequest: {
+            repository: entry.repository,
+            number: 7,
+            title: entry.pullRequest.title,
+            url: `https://github.com/${entry.repository}/pull/7`,
+            draft: true,
+            action: "created",
+          },
+        });
+      },
+    })));
+
+    expect(observed).toEqual([
+      "rebase",
+      "write:base-latest:head-after-rebase:fireclanker/openai-alpha/1",
+    ]);
+    expect(result).toMatchObject({
+      repository: "openai/alpha",
+      branch: "fireclanker/openai-alpha/1",
+      commit: "head-after-rebase",
+      baseSha: "base-latest",
+      expectedHeadSha: "head-after-rebase",
+      deterministicBranch: "fireclanker/openai-alpha/1",
+      pullRequest: { repository: "openai/alpha", number: 7, draft: true, action: "created" },
+    });
+  });
+
+  test("uses the same workspace conflict-resolution pass once before writing", async () => {
+    const observed: string[] = [];
+    const result = await Effect.runPromise(publishSafeRepository(safeEntry, 0, safePublisher({
+      rebase: () => {
+        observed.push("rebase-conflict");
+        return Effect.succeed({ kind: "conflict", baseSha: "base-2", message: "conflict" });
+      },
+      resolveConflict: () => {
+        observed.push("resolve-in-same-session");
+        return Effect.succeed({ kind: "clean", baseSha: "base-2", expectedHeadSha: "head-resolved" });
+      },
+      write: (prepared, entry) => {
+        observed.push(`write:${prepared.expectedHeadSha}`);
+        return Effect.succeed({
+          kind: "success",
+          pullRequest: {
+            repository: entry.repository,
+            number: 8,
+            title: entry.pullRequest.title,
+            url: `https://github.com/${entry.repository}/pull/8`,
+            draft: true,
+          },
+        });
+      },
+    })));
+
+    expect(observed).toEqual(["rebase-conflict", "resolve-in-same-session", "write:head-resolved"]);
+    expect(result.commit).toBe("head-resolved");
+  });
+
+  test("fails unresolved conflicts and second target advances without writing", async () => {
+    let writes = 0;
+    const unresolved = await Effect.runPromise(Effect.flip(publishSafeRepository(safeEntry, 0, safePublisher({
+      rebase: () => Effect.succeed({ kind: "conflict", baseSha: "base-3", message: "conflict" }),
+      resolveConflict: () => Effect.succeed({ kind: "conflict", baseSha: "base-3", message: "still conflicted" }),
+      write: () => {
+        writes += 1;
+        return Effect.fail(new ManifestPersistenceError({ operation: "write", message: "should not write" }));
+      },
+    }))));
+    const advanced = await Effect.runPromise(Effect.flip(publishSafeRepository(safeEntry, 0, safePublisher({
+      rebase: () => Effect.succeed({ kind: "advanced", baseSha: "base-4", message: "moved again" }),
+      write: () => {
+        writes += 1;
+        return Effect.fail(new ManifestPersistenceError({ operation: "write", message: "should not write" }));
+      },
+    }))));
+
+    expect(unresolved.message).toContain("Unresolved rebase conflict");
+    expect(advanced.message).toContain("Target advanced concurrently");
+    expect(writes).toBe(0);
+  });
+
+  test("reconciles ambiguous write success without creating duplicate pull requests", async () => {
+    let writes = 0;
+    const result = await Effect.runPromise(publishSafeRepository(safeEntry, 0, safePublisher({
+      write: () => {
+        writes += 1;
+        return Effect.succeed({ kind: "ambiguous", message: "timeout after GitHub write" });
+      },
+      reconcile: (prepared, entry) => Effect.succeed({
+        expectedHeadPresent: true,
+        branchHeadSha: prepared.expectedHeadSha,
+        pullRequest: {
+          repository: entry.repository,
+          number: 9,
+          title: entry.pullRequest.title,
+          url: `https://github.com/${entry.repository}/pull/9`,
+          draft: true,
+          action: "created",
+        },
+      }),
+    })));
+
+    expect(writes).toBe(1);
+    expect(result.pullRequest).toMatchObject({ number: 9, draft: true, action: "created" });
+  });
+
+  test("rejects ambiguous conflicting deterministic branches instead of overwriting them", async () => {
+    const failure = await Effect.runPromise(Effect.flip(publishSafeRepository(safeEntry, 0, safePublisher({
+      write: () => Effect.succeed({ kind: "ambiguous", message: "network reset" }),
+      reconcile: () => Effect.succeed({ expectedHeadPresent: false, branchHeadSha: "someone-elses-head" }),
+    }))));
+
+    expect(failure.message).toContain("already points at someone-elses-head");
+  });
+
+  test("records base SHA, expected head SHA, deterministic branch, and pull-request identity in multi-repository journals", async () => {
+    const result = await Effect.runPromise(publishPublicationPlan(plan, repositorySet, {
+      publish: (entry, order) => Effect.succeed({
+        repository: entry.repository,
+        branch: `fireclanker/${order}`,
+        commit: `head-${order}`,
+        baseSha: `base-${order}`,
+        expectedHeadSha: `head-${order}`,
+        deterministicBranch: `fireclanker/${order}`,
+        pullRequest: {
+          repository: entry.repository,
+          number: order + 1,
+          title: entry.pullRequest.title,
+          url: `https://github.com/${entry.repository}/pull/${order + 1}`,
+          draft: order !== 1,
+          action: order === 1 ? "updated" : "created",
+        },
+      }),
+    }));
+
+    expect(result.journal.map(({ repository, order, baseSha, expectedHeadSha, deterministicBranch, pullRequestIdentity, pullRequest }) => ({
+      repository,
+      order,
+      baseSha,
+      expectedHeadSha,
+      deterministicBranch,
+      pullRequestIdentity,
+      draft: pullRequest?.draft,
+      action: pullRequest?.action,
+    }))).toEqual([
+      { repository: "openai/alpha", order: 0, baseSha: "base-0", expectedHeadSha: "head-0", deterministicBranch: "fireclanker/0", pullRequestIdentity: "openai/alpha#1", draft: true, action: "created" },
+      { repository: "openai/bravo", order: 1, baseSha: "base-1", expectedHeadSha: "head-1", deterministicBranch: "fireclanker/1", pullRequestIdentity: "openai/bravo#2", draft: false, action: "updated" },
+      { repository: "openai/charlie", order: 2, baseSha: "base-2", expectedHeadSha: "head-2", deterministicBranch: "fireclanker/2", pullRequestIdentity: "openai/charlie#3", draft: true, action: "created" },
+    ]);
   });
 });
