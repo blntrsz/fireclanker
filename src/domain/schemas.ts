@@ -89,6 +89,8 @@ const PullRequestSchema = Schema.Struct({
   title: Schema.String,
   url: Schema.String,
   draft: Schema.Boolean,
+  action: Schema.optionalKey(Schema.Literals(["reused", "created", "updated"])),
+  description: Schema.optionalKey(Schema.String),
 });
 
 export const ChangeSetOutcomeSchema = Schema.Struct({

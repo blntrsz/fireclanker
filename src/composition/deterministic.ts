@@ -1,4 +1,5 @@
 import { mkdir, readdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
 import {
@@ -27,9 +28,11 @@ import {
   ExecutionTranscriptEventSchema,
   JobManifestSchema,
   JobStatusSchema,
+  ChangeSetOutcomeSchema,
   ResponseOutcomeSchema,
   type ExecutionTranscriptEvent,
   type JobManifest,
+  type RepositorySetMember,
 } from "../domain/schemas.js";
 
 const timestamps = [
@@ -74,6 +77,132 @@ const readTranscript = (jobId: string, cursor: string | undefined) =>
     }),
   );
 
+
+type PullRequestState = {
+  readonly number: number;
+  readonly branch: string;
+  readonly title: string;
+  readonly description: string;
+  readonly draft: boolean;
+  readonly state: "open" | "closed" | "merged";
+};
+
+type RepositoryPublicationState = {
+  readonly defaultBranch: string;
+  readonly nextPullRequestNumber: number;
+  readonly pullRequests: ReadonlyArray<PullRequestState>;
+};
+
+type PublicationState = Record<string, RepositoryPublicationState>;
+
+const publicationStatePath = () => join(stateDirectory(), "publication-state.json");
+const repositoryEnvKey = (repository: string) =>
+  `FIRECLANKER_TEST_REPOSITORY_DIRECTORY_${repository.replace(/[^a-z0-9]/gi, "_").toUpperCase()}`;
+
+const readPublicationState = async (): Promise<PublicationState> => {
+  const file = Bun.file(publicationStatePath());
+  return (await file.exists()) ? ((await file.json()) as PublicationState) : {};
+};
+
+const writePublicationState = async (state: PublicationState) => {
+  await mkdir(stateDirectory(), { recursive: true });
+  await Bun.write(publicationStatePath(), JSON.stringify(state));
+};
+
+const runGit = (cwd: string, args: ReadonlyArray<string>) => {
+  const result = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString()}`);
+  }
+  return result.stdout.toString().trim();
+};
+
+const publishDeterministicChangeSet = async (
+  jobId: string,
+  instruction: string,
+  repositorySet: ReadonlyArray<RepositorySetMember>,
+) => {
+  const state = await readPublicationState();
+  const pullRequests = [];
+  for (const member of repositorySet) {
+    const directory = process.env[repositoryEnvKey(member.repository)];
+    if (directory === undefined || !existsSync(directory)) {
+      throw new Error(`Repository ${member.repository} has no deterministic repository directory`);
+    }
+    const existingState = state[member.repository] ?? {
+      defaultBranch: "main",
+      nextPullRequestNumber: 1,
+      pullRequests: [],
+    };
+    const target = member.target ?? { kind: "branch" as const, name: `fireclanker/${jobId}` };
+    const branch = target.kind === "branch" ? target.name : target.headBranch;
+    const proposedTitle = `Fireclanker Change Set for ${jobId}`;
+    const proposedDescription = `Pi proposed description for ${jobId}\n\nFireclanker provenance: ${jobId}`;
+    let nextPullRequestNumber = existingState.nextPullRequestNumber;
+    let action: "reused" | "created" | "updated";
+    let pullRequest: PullRequestState | undefined;
+
+    if (target.kind === "pull-request") {
+      pullRequest = existingState.pullRequests.find((candidate) => candidate.number === target.number);
+      if (pullRequest === undefined || pullRequest.branch !== target.headBranch || pullRequest.state !== "open") {
+        throw new Error(`Pull request #${target.number} for ${member.repository} is not writable`);
+      }
+      action = "updated";
+      pullRequest = { ...pullRequest, description: proposedDescription };
+    } else {
+      pullRequest = existingState.pullRequests.find(
+        (candidate) => candidate.branch === branch && candidate.state === "open",
+      );
+      if (pullRequest === undefined) {
+        action = "created";
+        pullRequest = {
+          number: nextPullRequestNumber,
+          branch,
+          title: proposedTitle,
+          description: proposedDescription,
+          draft: true,
+          state: "open",
+        };
+        nextPullRequestNumber += 1;
+      } else {
+        action = "reused";
+      }
+    }
+
+    runGit(directory, ["checkout", branch]);
+    await Bun.write(join(directory, `.fireclanker-${jobId}.txt`), `${instruction}\n`);
+    runGit(directory, ["add", `.fireclanker-${jobId}.txt`]);
+    runGit(directory, ["commit", "-m", `Fireclanker ${jobId}`]);
+    const remote = runGit(directory, ["remote", "get-url", "origin"]);
+    runGit(directory, ["push", remote, `HEAD:${branch}`]);
+
+    state[member.repository] = {
+      defaultBranch: existingState.defaultBranch,
+      nextPullRequestNumber,
+      pullRequests: [
+        ...existingState.pullRequests.filter((candidate) => candidate.number !== pullRequest.number),
+        pullRequest,
+      ].sort((left, right) => left.number - right.number),
+    };
+    pullRequests.push({
+      repository: member.repository,
+      number: pullRequest.number,
+      title: pullRequest.title,
+      url: `https://github.com/${member.repository}/pull/${pullRequest.number}`,
+      draft: pullRequest.draft,
+      action,
+      description: pullRequest.description,
+    });
+  }
+  await writePublicationState(state);
+  return Schema.decodeUnknownSync(ChangeSetOutcomeSchema)({
+    version: 1,
+    kind: "change-set",
+    summary: `Published ${pullRequests.length} repository Change Set for ${jobId}`,
+    pullRequests,
+  });
+};
+
 const DeterministicPi = Layer.succeed(
   Pi,
   Pi.of({
@@ -111,11 +240,19 @@ const JobControlFromDeterministicServices = Layer.effect(
               new Error("The deterministic tracer only supports a Response Outcome"),
             );
           }
-          const outcome = Schema.decodeUnknownSync(ResponseOutcomeSchema)({
-            version: 1,
-            kind: "response",
-            response: completion.response,
-          });
+          const outcome = process.env.FIRECLANKER_TEST_PUBLICATION_ENABLED === "1"
+            ? yield* Effect.tryPromise({
+                try: () => publishDeterministicChangeSet(jobId, instruction, operation.repositorySet),
+                catch: (error) =>
+                  new JobNotFound({
+                    jobId,
+                  }),
+              })
+            : Schema.decodeUnknownSync(ResponseOutcomeSchema)({
+                version: 1,
+                kind: "response",
+                response: completion.response,
+              });
           const queuedAt = yield* time.now;
           const runningAt = yield* time.now;
           const outcomeAt = yield* time.now;

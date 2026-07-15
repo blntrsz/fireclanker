@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -58,6 +58,45 @@ const invokeProduction = (arguments_: ReadonlyArray<string>) =>
     stdout: "pipe",
     stderr: "pipe",
   });
+
+const git = (cwd: string, arguments_: ReadonlyArray<string>) => {
+  const result = Bun.spawnSync(["git", ...arguments_], {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  expect(result.exitCode, result.stderr.toString()).toBe(0);
+  return result.stdout.toString().trim();
+};
+
+const deterministicRepositoryEnvironment = (repository: string, directory: string) => ({
+  FIRECLANKER_TEST_PUBLICATION_ENABLED: "1",
+  [`FIRECLANKER_TEST_REPOSITORY_DIRECTORY_${repository.replace(/[^a-z0-9]/gi, "_").toUpperCase()}`]: directory,
+});
+
+const createDisposableRepository = async (branch = "feature") => {
+  const directory = await mkdtemp(join(tmpdir(), "fireclanker-repo-"));
+  const remote = join(directory, "remote.git");
+  const worktree = join(directory, "worktree");
+  await mkdir(worktree);
+  git(directory, ["init", "--bare", remote]);
+  git(worktree, ["init", "-b", "main"]);
+  git(worktree, ["config", "user.email", "fireclanker@example.test"]);
+  git(worktree, ["config", "user.name", "Fireclanker Test"]);
+  await writeFile(join(worktree, "README.md"), "initial\n");
+  git(worktree, ["add", "README.md"]);
+  git(worktree, ["commit", "-m", "Initial commit"]);
+  git(worktree, ["remote", "add", "origin", remote]);
+  git(worktree, ["push", "origin", "main"]);
+  git(worktree, ["checkout", "-b", branch]);
+  git(worktree, ["push", "origin", branch]);
+  return { directory, remote, worktree };
+};
+
+const readPublicationState = async () => JSON.parse(
+  await Bun.file(join(stateDirectory, "publication-state.json")).text(),
+);
+
 
 beforeAll(async () => {
   stateDirectory = await mkdtemp(join(tmpdir(), "fireclanker-acceptance-"));
@@ -163,6 +202,159 @@ describe("compiled deterministic CLI", () => {
     expect(JSON.parse(snapshot.stdout.toString()).manifest.submission.repositorySet).toEqual([
       { repository: "openai/example", target: { kind: "branch", name: "main" } },
     ]);
+  });
+
+
+
+  test("publishes a branch Repository Target by creating a draft pull request", async () => {
+    const repository = "openai/example";
+    const disposable = await createDisposableRepository("feature");
+    const submitted = invoke([
+      "--json",
+      "run",
+      "Publish branch target",
+      "--repos",
+      repository,
+      "--target",
+      `${repository}:branch:feature`,
+    ], deterministicRepositoryEnvironment(repository, disposable.worktree));
+
+    expect(submitted.exitCode, submitted.stderr.toString()).toBe(0);
+    const jobId = JSON.parse(submitted.stdout.toString()).jobId as string;
+    expect(git(disposable.worktree, ["rev-parse", "feature"])).toBe(
+      git(disposable.remote, ["rev-parse", "feature"]),
+    );
+
+    const snapshot = invoke(["--json", "get", jobId]);
+    const outcome = JSON.parse(snapshot.stdout.toString()).manifest.outcome;
+    expect(outcome.kind).toBe("change-set");
+    expect(outcome.pullRequests).toEqual([
+      expect.objectContaining({
+        repository,
+        number: 1,
+        draft: true,
+        action: "created",
+      }),
+    ]);
+    expect((await readPublicationState())[repository].pullRequests[0]).toMatchObject({
+      branch: "feature",
+      draft: true,
+      state: "open",
+    });
+  });
+
+  test("reuses an open pull request for a branch target without changing metadata", async () => {
+    const repository = "openai/example";
+    const disposable = await createDisposableRepository("feature-reuse");
+    await writeFile(join(stateDirectory, "publication-state.json"), JSON.stringify({
+      [repository]: {
+        defaultBranch: "main",
+        nextPullRequestNumber: 8,
+        pullRequests: [{
+          number: 7,
+          branch: "feature-reuse",
+          title: "Keep title",
+          description: "Keep description",
+          draft: false,
+          state: "open",
+        }],
+      },
+    }));
+
+    const submitted = invoke([
+      "--json",
+      "run",
+      "Reuse branch target",
+      "--repos",
+      repository,
+      "--target",
+      `${repository}:branch:feature-reuse`,
+    ], deterministicRepositoryEnvironment(repository, disposable.worktree));
+
+    expect(submitted.exitCode, submitted.stderr.toString()).toBe(0);
+    const jobId = JSON.parse(submitted.stdout.toString()).jobId as string;
+    const snapshot = invoke(["--json", "get", jobId]);
+    const pullRequest = JSON.parse(snapshot.stdout.toString()).manifest.outcome.pullRequests[0];
+    expect(pullRequest).toMatchObject({
+      number: 7,
+      title: "Keep title",
+      draft: false,
+      action: "reused",
+      description: "Keep description",
+    });
+  });
+
+  test("updates an explicit pull-request target while preserving title and draft state", async () => {
+    const repository = "openai/example";
+    const disposable = await createDisposableRepository("feature-pr");
+    await writeFile(join(stateDirectory, "publication-state.json"), JSON.stringify({
+      [repository]: {
+        defaultBranch: "main",
+        nextPullRequestNumber: 12,
+        pullRequests: [{
+          number: 11,
+          branch: "feature-pr",
+          title: "Existing review",
+          description: "Old description",
+          draft: false,
+          state: "open",
+        }],
+      },
+    }));
+
+    const submitted = invoke([
+      "--json",
+      "run",
+      "Update pull request target",
+      "--repos",
+      repository,
+      "--target",
+      `${repository}:pull-request:11:feature-pr`,
+    ], deterministicRepositoryEnvironment(repository, disposable.worktree));
+
+    expect(submitted.exitCode, submitted.stderr.toString()).toBe(0);
+    const jobId = JSON.parse(submitted.stdout.toString()).jobId as string;
+    const snapshot = invoke(["--json", "get", jobId]);
+    const pullRequest = JSON.parse(snapshot.stdout.toString()).manifest.outcome.pullRequests[0];
+    expect(pullRequest).toMatchObject({
+      number: 11,
+      title: "Existing review",
+      draft: false,
+      action: "updated",
+    });
+    expect(pullRequest.description).toContain(`Fireclanker provenance: ${jobId}`);
+  });
+
+  test("rejects a closed pull-request Repository Target", async () => {
+    const repository = "openai/example";
+    const disposable = await createDisposableRepository("feature-closed");
+    await writeFile(join(stateDirectory, "publication-state.json"), JSON.stringify({
+      [repository]: {
+        defaultBranch: "main",
+        nextPullRequestNumber: 3,
+        pullRequests: [{
+          number: 2,
+          branch: "feature-closed",
+          title: "Closed review",
+          description: "Closed description",
+          draft: false,
+          state: "closed",
+        }],
+      },
+    }));
+
+    const submitted = invoke([
+      "--json",
+      "run",
+      "Reject closed pull request",
+      "--repos",
+      repository,
+      "--target",
+      `${repository}:pull-request:2:feature-closed`,
+    ], deterministicRepositoryEnvironment(repository, disposable.worktree));
+
+    expect(submitted.exitCode).not.toBe(0);
+    expect(submitted.stderr.toString()).toContain("error");
   });
 
   test("run rejects Repository Targets outside the Repository Set", () => {
