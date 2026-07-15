@@ -8,12 +8,16 @@ const executable = join(root, "dist", "fireclanker-test");
 const productionExecutable = join(root, "dist", "fireclanker");
 let stateDirectory: string;
 
-const invoke = (arguments_: ReadonlyArray<string>) =>
+const invoke = (
+  arguments_: ReadonlyArray<string>,
+  environment: Readonly<Record<string, string>> = {},
+) =>
   Bun.spawnSync([executable, ...arguments_], {
     cwd: root,
     env: {
       ...process.env,
       FIRECLANKER_TEST_STATE_DIRECTORY: stateDirectory,
+      ...environment,
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -98,6 +102,19 @@ describe("compiled deterministic CLI", () => {
     );
   });
 
+  test("run generates a fresh Job ID client-side for each submission", () => {
+    const first = invoke(["run", "Same canonical submission"]);
+    const second = invoke(["run", "Same canonical submission"]);
+    const firstJobId = first.stdout.toString().match(/job-[a-f0-9]{12}/)?.[0];
+    const secondJobId = second.stdout.toString().match(/job-[a-f0-9]{12}/)?.[0];
+
+    expect(first.exitCode).toBe(0);
+    expect(second.exitCode).toBe(0);
+    expect(firstJobId).toBeDefined();
+    expect(secondJobId).toBeDefined();
+    expect(secondJobId).not.toBe(firstJobId);
+  });
+
   test("get and get --watch expose a succeeded Response Job", () => {
     const submitted = invoke(["run", "Describe a tracer bullet"]);
     const jobId = submitted.stdout.toString().match(/job-[a-f0-9]{12}/)?.[0];
@@ -106,8 +123,12 @@ describe("compiled deterministic CLI", () => {
     const snapshot = invoke(["get", jobId!]);
     expect(snapshot.exitCode).toBe(0);
     expect(snapshot.stderr.toString()).toBe("");
-    expect(snapshot.stdout.toString()).toBe(
-      `Job ${jobId}\nStatus: succeeded\nResponse: Deterministic response to: Describe a tracer bullet\n`,
+    expect(snapshot.stdout.toString()).toContain(`Job ${jobId}\nStatus: succeeded\n`);
+    expect(snapshot.stdout.toString()).toContain("Instruction: Describe a tracer bullet\n");
+    expect(snapshot.stdout.toString()).toContain("Repositories: (empty)\n");
+    expect(snapshot.stdout.toString()).toContain("Transitions: queued@");
+    expect(snapshot.stdout.toString()).toContain(
+      "Response: Deterministic response to: Describe a tracer bullet\n",
     );
 
     const watched = invoke(["get", jobId!, "--watch"]);
@@ -183,16 +204,15 @@ describe("compiled deterministic CLI", () => {
     });
   });
 
-  test("the production executable never falls back to deterministic fixtures", () => {
+  test("the production executable requires Deployment configuration before invocation", () => {
     const result = invokeProduction(["--json", "run", "Do production work"]);
 
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(2);
     expect(result.stdout.toString()).toBe("");
-    expect(JSON.parse(result.stderr.toString())).toEqual({
+    expect(JSON.parse(result.stderr.toString())).toMatchObject({
       version: 1,
       event: "error",
-      code: "deployment_unavailable",
-      message: "Deployment unavailable: no production Deployment adapter is configured",
+      code: "invalid_configuration",
     });
   });
 
@@ -228,6 +248,98 @@ describe("compiled deterministic CLI", () => {
       event: "error",
       code: "invalid_usage",
       message: "Use exactly one instruction source: positional text or --file",
+    });
+  });
+
+  test("list paginates newest first and cancel is queued-only and idempotent", () => {
+    const submitted = ["Oldest", "Middle", "Newest"].map((instruction) => {
+      const result = invoke(["--json", "run", instruction]);
+      expect(result.exitCode).toBe(0);
+      return JSON.parse(result.stdout.toString()) as { jobId: string };
+    });
+
+    const first = invoke(["--json", "list", "--limit", "2"]);
+    expect(first.exitCode, first.stderr.toString()).toBe(0);
+    const firstPage = JSON.parse(first.stdout.toString());
+    expect(firstPage.event).toBe("job-list");
+    expect(firstPage.jobs.map((job: { jobId: string }) => job.jobId)).toEqual([
+      submitted[2]!.jobId,
+      submitted[1]!.jobId,
+    ]);
+    expect(firstPage.nextCursor).toMatch(/^cursor-/);
+
+    const next = invoke(["--json", "list", "--limit", "2", "--cursor", firstPage.nextCursor]);
+    expect(next.exitCode, next.stderr.toString()).toBe(0);
+    expect(JSON.parse(next.stdout.toString()).jobs[0].jobId).toBe(submitted[0]!.jobId);
+
+    const human = invoke(["list", "--status", "succeeded", "--limit", "1"]);
+    expect(human.exitCode).toBe(0);
+    expect(human.stdout.toString()).toContain(submitted[2]!.jobId);
+    expect(human.stdout.toString()).toMatch(
+      /Continue with: fireclanker list --status succeeded --limit 1 --cursor cursor-/,
+    );
+
+    const queued = invoke(
+      ["--json", "run", "Cancel this queued Job"],
+      { FIRECLANKER_TEST_EXECUTION_DISABLED: "1" },
+    );
+    const queuedJobId = JSON.parse(queued.stdout.toString()).jobId as string;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const cancelled = invoke(["--json", "cancel", queuedJobId]);
+      expect(cancelled.exitCode, cancelled.stderr.toString()).toBe(0);
+      expect(JSON.parse(cancelled.stdout.toString())).toEqual({
+        version: 1,
+        event: "job-cancelled",
+        jobId: queuedJobId,
+        status: "cancelled",
+      });
+    }
+
+    const terminal = invoke(["--json", "cancel", submitted[0]!.jobId]);
+    expect(terminal.exitCode).toBe(1);
+    expect(JSON.parse(terminal.stderr.toString()).code).toBe("job_not_cancellable");
+  }, 15_000);
+
+  test("get returns terminal failure data without transcript replay", () => {
+    const submitted = invoke(
+      ["--json", "run", "Inspect cancellation snapshot"],
+      { FIRECLANKER_TEST_EXECUTION_DISABLED: "1" },
+    );
+    const jobId = JSON.parse(submitted.stdout.toString()).jobId as string;
+    expect(invoke(["cancel", jobId]).exitCode).toBe(0);
+
+    const snapshot = invoke(["--json", "get", jobId]);
+    expect(snapshot.exitCode).toBe(0);
+    expect(snapshot.stderr.toString()).toBe("");
+    expect(JSON.parse(snapshot.stdout.toString())).toMatchObject({
+      version: 1,
+      event: "job-status",
+      jobId,
+      status: "cancelled",
+      failure: { code: "cancelled", message: "Job cancelled by user" },
+      manifest: {
+        jobId,
+        submission: { instruction: "Inspect cancellation snapshot", repositorySet: [] },
+        status: "cancelled",
+        transitions: [{ status: "queued" }, { status: "cancelled" }],
+        audit: { submittedAt: expect.any(String), submittedBy: expect.any(String) },
+        runtime: { writerGeneration: 0 },
+        transcript: { highestCursor: null },
+        artifacts: {},
+      },
+    });
+  });
+
+  test("list rejects an invalid cursor with a stable structured error and exit status", () => {
+    const result = invoke(["--json", "list", "--cursor", "not-a-cursor"]);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).toBe("");
+    expect(JSON.parse(result.stderr.toString())).toEqual({
+      version: 1,
+      event: "error",
+      code: "invalid_cursor",
+      message: "Invalid Job list cursor",
     });
   });
 

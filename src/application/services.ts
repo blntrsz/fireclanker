@@ -1,6 +1,8 @@
-import { Context, Data, Effect } from "effect";
+import { Context, Effect, Schema } from "effect";
 import type {
   ControlGetOperation,
+  ControlListOperation,
+  ControlCancelOperation,
   ControlRunOperation,
   ControlTranscriptOperation,
   ExecutionTranscriptEvent,
@@ -13,49 +15,87 @@ import type {
   DeploymentPlan,
 } from "../domain/deployment.js";
 
-export class DeploymentUnavailable extends Data.TaggedError("DeploymentUnavailable")<{
-  readonly message: string;
-}> {}
+export class DeploymentUnavailable extends Schema.TaggedErrorClass<DeploymentUnavailable>()(
+  "DeploymentUnavailable",
+  { message: Schema.String },
+) {}
+export class JobNotFound extends Schema.TaggedErrorClass<JobNotFound>()("JobNotFound", {
+  jobId: Schema.String,
+}) {}
+export class JobNotCancellable extends Schema.TaggedErrorClass<JobNotCancellable>()(
+  "JobNotCancellable",
+  { jobId: Schema.String },
+) {}
+export class JobIdempotencyConflict extends Schema.TaggedErrorClass<JobIdempotencyConflict>()(
+  "JobIdempotencyConflict",
+  { jobId: Schema.String, message: Schema.String },
+) {}
+export class InvalidCursor extends Schema.TaggedErrorClass<InvalidCursor>()("InvalidCursor", {
+  message: Schema.String,
+}) {}
+export class InvalidUsage extends Schema.TaggedErrorClass<InvalidUsage>()("InvalidUsage", {
+  message: Schema.String,
+}) {}
+export class InstructionReadFailure extends Schema.TaggedErrorClass<InstructionReadFailure>()(
+  "InstructionReadFailure",
+  { path: Schema.String, message: Schema.String },
+) {}
+export class InvalidConfiguration extends Schema.TaggedErrorClass<InvalidConfiguration>()(
+  "InvalidConfiguration",
+  { message: Schema.String },
+) {}
+export class ConfirmationRequired extends Schema.TaggedErrorClass<ConfirmationRequired>()(
+  "ConfirmationRequired",
+  { message: Schema.String },
+) {}
+export class GitHubTokenRequired extends Schema.TaggedErrorClass<GitHubTokenRequired>()(
+  "GitHubTokenRequired",
+  { message: Schema.String },
+) {}
+export class DeploymentOperationFailure extends Schema.TaggedErrorClass<DeploymentOperationFailure>()(
+  "DeploymentOperationFailure",
+  { message: Schema.String },
+) {}
+export class StaleManifest extends Schema.TaggedErrorClass<StaleManifest>()("StaleManifest", {
+  jobId: Schema.String,
+}) {}
+export class ManifestPersistenceError extends Schema.TaggedErrorClass<ManifestPersistenceError>()(
+  "ManifestPersistenceError",
+  { operation: Schema.String, message: Schema.String },
+) {}
 
-export class JobNotFound extends Data.TaggedError("JobNotFound")<{
-  readonly jobId: string;
-}> {}
-
-export class InvalidUsage extends Data.TaggedError("InvalidUsage")<{
-  readonly message: string;
-}> {}
-
-export class InstructionReadFailure extends Data.TaggedError("InstructionReadFailure")<{
-  readonly path: string;
-  readonly message: string;
-}> {}
-
-export class InvalidConfiguration extends Data.TaggedError("InvalidConfiguration")<{
-  readonly message: string;
-}> {}
-
-export class ConfirmationRequired extends Data.TaggedError("ConfirmationRequired")<{
-  readonly message: string;
-}> {}
-
-export class GitHubTokenRequired extends Data.TaggedError("GitHubTokenRequired")<{
-  readonly message: string;
-}> {}
-
-export class DeploymentOperationFailure extends Data.TaggedError("DeploymentOperationFailure")<{
-  readonly message: string;
-}> {}
+type JobControlError =
+  | DeploymentUnavailable
+  | InvalidConfiguration
+  | JobIdempotencyConflict
+  | JobNotFound
+  | JobNotCancellable
+  | InvalidCursor;
 
 export interface JobControlService {
   readonly submit: (
     operation: ControlRunOperation,
-  ) => Effect.Effect<JobManifest, DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
   readonly get: (
     operation: ControlGetOperation,
-  ) => Effect.Effect<JobManifest, JobNotFound | DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
+  readonly list: (
+    operation: ControlListOperation,
+    configurationPath?: string,
+  ) => Effect.Effect<
+    { readonly jobs: ReadonlyArray<JobManifest>; readonly nextCursor?: string | undefined },
+    JobControlError
+  >;
+  readonly cancel: (
+    operation: ControlCancelOperation,
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
   readonly watch: (
     operation: ControlTranscriptOperation,
-  ) => Effect.Effect<ReadonlyArray<ExecutionTranscriptEvent>, JobNotFound | DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<ReadonlyArray<ExecutionTranscriptEvent>, JobControlError>;
 }
 
 export class JobControl extends Context.Service<JobControl, JobControlService>()(
