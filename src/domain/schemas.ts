@@ -83,7 +83,7 @@ export const ResponseOutcomeSchema = Schema.Struct({
   response: Schema.String,
 });
 
-const PullRequestSchema = Schema.Struct({
+export const PullRequestSchema = Schema.Struct({
   repository: RepositoryName,
   number: Schema.Int.check(Schema.isGreaterThan(0)),
   title: Schema.String,
@@ -111,11 +111,19 @@ export const PublicationPlanSchema = Schema.Struct({
   ),
 });
 
+const RetainedBranchSchema = Schema.Struct({
+  repository: RepositoryName,
+  branch: Schema.String,
+  commit: Schema.String,
+});
+
 export const PublicationFailureSchema = Schema.Struct({
   version: Version,
   kind: Schema.Literal("publication-failure"),
   code: Schema.String,
-  completed: Schema.Array(PullRequestSchema),
+  message: Schema.String,
+  retainedBranches: Schema.Array(RetainedBranchSchema),
+  pullRequests: Schema.Array(PullRequestSchema),
   failedRepository: RepositoryName,
   unattemptedRepositories: Schema.Array(RepositoryName),
 });
@@ -151,7 +159,7 @@ export const JobManifestSchema = Schema.Struct({
   }),
   transcript: Schema.Struct({ highestCursor: Schema.NullOr(Schema.String) }),
   outcome: Schema.optionalKey(OutcomeSchema),
-  failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String })),
+  failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String, publication: Schema.optionalKey(PublicationFailureSchema) })),
   artifacts: Schema.Struct({
     transcript: Schema.optionalKey(Schema.String),
     piSession: Schema.optionalKey(Schema.String),
@@ -217,7 +225,7 @@ export const CliEventSchema = Schema.Union([
     timestamp: Schema.optionalKey(Timestamp),
     cursor: Schema.optionalKey(Schema.String),
     outcome: Schema.optionalKey(OutcomeSchema),
-    failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String })),
+    failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String, publication: Schema.optionalKey(PublicationFailureSchema) })),
     manifest: Schema.optionalKey(JobManifestSchema),
   }),
   Schema.Struct({
@@ -248,6 +256,10 @@ export const CliEventSchema = Schema.Union([
   }),
 ]);
 
+export interface PullRequest extends Schema.Schema.Type<typeof PullRequestSchema> {}
+export interface ChangeSetOutcome extends Schema.Schema.Type<typeof ChangeSetOutcomeSchema> {}
+export interface PublicationPlan extends Schema.Schema.Type<typeof PublicationPlanSchema> {}
+export interface PublicationFailure extends Schema.Schema.Type<typeof PublicationFailureSchema> {}
 export interface JobManifest extends Schema.Schema.Type<typeof JobManifestSchema> {}
 export type ExecutionTranscriptEvent = typeof ExecutionTranscriptEventSchema.Type;
 export type PiCompletion = typeof PiCompletionSchema.Type;

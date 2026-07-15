@@ -46,7 +46,7 @@ export type SettleOperation =
       readonly operation: "settle";
       readonly jobId: string;
       readonly status: "failed";
-      readonly failure: { readonly code: string; readonly message: string };
+      readonly failure: NonNullable<JobManifest["failure"]>;
     };
 
 export type JobOperation =
