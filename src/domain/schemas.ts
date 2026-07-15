@@ -210,6 +210,7 @@ export const CliEventSchema = Schema.Union([
     cursor: Schema.optional(Schema.String),
     outcome: Schema.optional(OutcomeSchema),
     failure: Schema.optional(Schema.Struct({ code: Schema.String, message: Schema.String })),
+    manifest: Schema.optional(JobManifestSchema),
   }),
   Schema.Struct({
     version: Version,

@@ -95,6 +95,26 @@ describe("Control Job operations", () => {
     });
   });
 
+  test("concurrent duplicate cancellation converges on the cancelled Job", async () => {
+    const controller = makeJobController({
+      store: new InMemoryManifestStore(),
+      now: () => "2000-01-01T00:00:00.000Z",
+      submittedBy: () => "arn:aws:iam::123456789012:user/tester",
+      wakeLaunch: async () => {},
+    });
+    await controller.handle(submission);
+    const cancel = { version: 1 as const, operation: "cancel" as const, jobId: submission.jobId };
+
+    const [first, second] = await Promise.all([
+      controller.handle(cancel),
+      controller.handle(cancel),
+    ]);
+
+    expect(first.status).toBe("cancelled");
+    expect(second).toEqual(first);
+    expect(first.transitions.filter(({ status }) => status === "cancelled")).toHaveLength(1);
+  });
+
   test("competing terminal writes use ETags so the first terminal status wins", async () => {
     const controller = makeJobController({
       store: new InMemoryManifestStore(),

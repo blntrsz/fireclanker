@@ -48,7 +48,7 @@ const unavailable = () =>
     }),
   );
 
-class ControlResponseError extends Error {
+class ControlInvocationError extends Error {
   constructor(
     readonly code: string,
     message: string,
@@ -58,8 +58,8 @@ class ControlResponseError extends Error {
   }
 }
 
-const controlResponseFailure = (error: unknown) => {
-  if (error instanceof ControlResponseError) {
+const controlInvocationFailure = (error: unknown) => {
+  if (error instanceof ControlInvocationError) {
     if (error.code === "job_not_found") return new JobNotFound({ jobId: error.jobId ?? "unknown" });
     if (error.code === "job_not_cancellable") {
       return new JobNotCancellable({ jobId: error.jobId ?? "unknown" });
@@ -108,7 +108,7 @@ export const ProductionJobControl = Layer.effect(
               error?: { code?: string; message?: string };
             };
             if (decoded.version !== 1 || decoded.ok !== true) {
-              throw new ControlResponseError(
+              throw new ControlInvocationError(
                 decoded.error?.code ?? "control_operation_failed",
                 decoded.error?.message ?? "Control Lambda rejected the operation",
                 "jobId" in operation ? operation.jobId : undefined,
@@ -116,23 +116,23 @@ export const ProductionJobControl = Layer.effect(
             }
             return decoded.value;
           },
-          catch: controlResponseFailure,
+          catch: controlInvocationFailure,
         });
       });
 
+    const decodeManifest = Schema.decodeUnknownSync(JobManifestSchema, {
+      onExcessProperty: "error",
+    });
+    const invokeManifest = (
+      operation: Exclude<ControlOperation, { readonly operation: "list" | "transcript" }>,
+      configurationPath: string | undefined,
+    ) => invoke(operation, configurationPath).pipe(Effect.map(decodeManifest));
+
     return {
       submit: (operation, configurationPath) =>
-        invoke(operation, configurationPath).pipe(
-          Effect.map((value) =>
-            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
-          ),
-        ),
+        invokeManifest(operation, configurationPath),
       get: (operation, configurationPath) =>
-        invoke(operation, configurationPath).pipe(
-          Effect.map((value) =>
-            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
-          ),
-        ),
+        invokeManifest(operation, configurationPath),
       list: (operation, configurationPath) =>
         invoke(operation, configurationPath).pipe(
           Effect.map((value) =>
@@ -140,11 +140,7 @@ export const ProductionJobControl = Layer.effect(
           ),
         ),
       cancel: (operation, configurationPath) =>
-        invoke(operation, configurationPath).pipe(
-          Effect.map((value) =>
-            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
-          ),
-        ),
+        invokeManifest(operation, configurationPath),
       watch: unavailable,
     };
   }),

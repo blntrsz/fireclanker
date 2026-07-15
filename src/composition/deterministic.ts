@@ -2,6 +2,12 @@ import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
 import {
+  InvalidCursor as ManifestInvalidCursor,
+  JobNotCancellableError,
+  cancelJobManifest,
+  paginateJobManifests,
+} from "../application/job-controller.js";
+import {
   DeploymentCore,
   DeploymentOperationFailure,
   JobControl,
@@ -228,75 +234,29 @@ const JobControlFromDeterministicServices = Layer.effect(
             const retained = (
               await Promise.all(files.map((file) => Bun.file(join(stateDirectory(), file)).json()))
             )
-              .map((input) => decodeManifest(input))
-              .filter(
-                (manifest) => operation.status === undefined || manifest.status === operation.status,
-              )
-              .sort(
-                (left, right) =>
-                  right.audit.submittedAt.localeCompare(left.audit.submittedAt) ||
-                  right.jobId.localeCompare(left.jobId),
-              );
-            let offset = 0;
-            if (operation.cursor !== undefined) {
-              try {
-                const cursor = JSON.parse(
-                  Buffer.from(operation.cursor.replace(/^cursor-/, ""), "base64url").toString(),
-                ) as { offset: number; status: string | null };
-                if (
-                  !operation.cursor.startsWith("cursor-") ||
-                  !Number.isInteger(cursor.offset) ||
-                  cursor.offset < 0 ||
-                  cursor.status !== (operation.status ?? null)
-                ) {
-                  throw new Error();
-                }
-                offset = cursor.offset;
-              } catch {
-                throw new InvalidCursor({ message: "Invalid Job list cursor" });
-              }
-            }
-            const jobs = retained.slice(offset, offset + operation.limit);
-            const nextOffset = offset + jobs.length;
-            return {
-              jobs,
-              ...(nextOffset < retained.length
-                ? {
-                    nextCursor: `cursor-${Buffer.from(
-                      JSON.stringify({ offset: nextOffset, status: operation.status ?? null }),
-                    ).toString("base64url")}`,
-                  }
-                : {}),
-            };
+              .map((input) => decodeManifest(input));
+            return paginateJobManifests(retained, operation);
           },
           catch: (error) =>
-            error instanceof InvalidCursor
-              ? error
+            error instanceof ManifestInvalidCursor
+              ? new InvalidCursor({ message: error.message })
               : new InvalidCursor({ message: "Unable to list retained Jobs" }),
         }),
       cancel: (operation) =>
         Effect.tryPromise({
           try: async () => {
-            const manifest = await Effect.runPromise(readManifest(operation.jobId));
-            if (manifest.status === "cancelled") return manifest;
-            if (manifest.status !== "queued" && manifest.status !== "running") {
-              throw new JobNotCancellable({ jobId: operation.jobId });
-            }
-            const cancelled: JobManifest = {
-              ...manifest,
-              status: "cancelled",
-              transitions: [
-                ...manifest.transitions,
-                { status: "cancelled", timestamp: new Date().toISOString() },
-              ],
-              failure: { code: "cancelled", message: "Job cancelled by user" },
-            };
+            const file = Bun.file(manifestPath(operation.jobId));
+            if (!(await file.exists())) throw new JobNotFound({ jobId: operation.jobId });
+            const manifest = decodeManifest(await file.json());
+            const cancelled = cancelJobManifest(manifest, new Date().toISOString());
             await Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled));
             return cancelled;
           },
           catch: (error) =>
-            error instanceof JobNotFound || error instanceof JobNotCancellable
+            error instanceof JobNotFound
               ? error
+              : error instanceof JobNotCancellableError
+                ? new JobNotCancellable({ jobId: error.jobId })
               : new JobNotFound({ jobId: operation.jobId }),
         }),
       watch: (operation) => readTranscript(operation.jobId),

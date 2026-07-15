@@ -123,8 +123,12 @@ describe("compiled deterministic CLI", () => {
     const snapshot = invoke(["get", jobId!]);
     expect(snapshot.exitCode).toBe(0);
     expect(snapshot.stderr.toString()).toBe("");
-    expect(snapshot.stdout.toString()).toBe(
-      `Job ${jobId}\nStatus: succeeded\nResponse: Deterministic response to: Describe a tracer bullet\n`,
+    expect(snapshot.stdout.toString()).toContain(`Job ${jobId}\nStatus: succeeded\n`);
+    expect(snapshot.stdout.toString()).toContain("Instruction: Describe a tracer bullet\n");
+    expect(snapshot.stdout.toString()).toContain("Repositories: (empty)\n");
+    expect(snapshot.stdout.toString()).toContain("Transitions: queued@");
+    expect(snapshot.stdout.toString()).toContain(
+      "Response: Deterministic response to: Describe a tracer bullet\n",
     );
 
     const watched = invoke(["get", jobId!, "--watch"]);
@@ -313,6 +317,29 @@ describe("compiled deterministic CLI", () => {
       jobId,
       status: "cancelled",
       failure: { code: "cancelled", message: "Job cancelled by user" },
+      manifest: {
+        jobId,
+        submission: { instruction: "Inspect cancellation snapshot", repositorySet: [] },
+        status: "cancelled",
+        transitions: [{ status: "queued" }, { status: "cancelled" }],
+        audit: { submittedAt: expect.any(String), submittedBy: expect.any(String) },
+        runtime: { writerGeneration: 0 },
+        transcript: { highestCursor: null },
+        artifacts: {},
+      },
+    });
+  });
+
+  test("list rejects an invalid cursor with a stable structured error and exit status", () => {
+    const result = invoke(["--json", "list", "--cursor", "not-a-cursor"]);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout.toString()).toBe("");
+    expect(JSON.parse(result.stderr.toString())).toEqual({
+      version: 1,
+      event: "error",
+      code: "invalid_cursor",
+      message: "Invalid Job list cursor",
     });
   });
 

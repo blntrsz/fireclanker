@@ -3,9 +3,10 @@ import { Schema } from "effect";
 import {
   IdempotencyConflict,
   InvalidCursor,
+  JobNotCancellableError,
+  JobNotFoundError,
   StaleManifest,
   makeJobController,
-  type JobOperation,
 } from "../application/job-controller.js";
 import { S3ManifestStore } from "../infrastructure/s3-manifest-store.js";
 import { ControlOperationSchema } from "../domain/schemas.js";
@@ -25,10 +26,9 @@ const lambda = new LambdaClient(awsConfiguration);
 const errorCode = (error: unknown) => {
   if (error instanceof IdempotencyConflict) return error.code;
   if (error instanceof InvalidCursor) return error.code;
+  if (error instanceof JobNotFoundError) return error.code;
+  if (error instanceof JobNotCancellableError) return error.code;
   if (error instanceof StaleManifest) return error.code;
-  const message = error instanceof Error ? error.message : "Control operation failed";
-  if (message.endsWith(" not found")) return "job_not_found";
-  if (message.endsWith(" is not cancellable")) return "job_not_cancellable";
   return "control_operation_failed";
 };
 
@@ -42,6 +42,7 @@ export const handler = async (event: unknown, context: LambdaContext) => {
     event.operation === "launch" &&
     "jobId" in event &&
     typeof event.jobId === "string" &&
+    /^job-[a-f0-9]{12}$/.test(event.jobId) &&
     Object.keys(event).every((key) => ["version", "operation", "jobId"].includes(key))
   ) {
     return { version: 1, ok: true, value: { accepted: true } };
@@ -51,6 +52,9 @@ export const handler = async (event: unknown, context: LambdaContext) => {
     const operation = Schema.decodeUnknownSync(ControlOperationSchema, {
       onExcessProperty: "error",
     })(event);
+    if (operation.operation === "transcript") {
+      throw new Error("Execution Transcript reads are unavailable until execution is enabled");
+    }
     const controller = makeJobController({
       store,
       now: () => new Date().toISOString(),
@@ -71,7 +75,7 @@ export const handler = async (event: unknown, context: LambdaContext) => {
         );
       },
     });
-    const value = await controller.handle(operation as JobOperation);
+    const value = await controller.handle(operation);
     return { version: 1, ok: true, value };
   } catch (error) {
     return {

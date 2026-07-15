@@ -7,11 +7,10 @@ import {
 } from "@aws-sdk/client-s3";
 import { Schema } from "effect";
 import type {
-  JobManifest,
   ManifestStore,
   StoredManifest,
 } from "../application/job-controller.js";
-import { JobManifestSchema } from "../domain/schemas.js";
+import { JobManifestSchema, type JobManifest } from "../domain/schemas.js";
 
 const decodeManifest = Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" });
 
@@ -20,7 +19,8 @@ const isPreconditionFailure = (error: unknown) =>
     ?.httpStatusCode === 412 || (error as { readonly name?: string }).name === "PreconditionFailed";
 
 const manifestKey = (manifest: JobManifest) => {
-  const date = manifest.audit.submittedAt.slice(0, 10).replaceAll("-", "/");
+  const submittedSecond = Number.parseInt(manifest.jobId.slice(4, 12), 16);
+  const date = new Date(submittedSecond * 1_000).toISOString().slice(0, 10).replaceAll("-", "/");
   return `jobs/${date}/${manifest.jobId}/manifest.json`;
 };
 

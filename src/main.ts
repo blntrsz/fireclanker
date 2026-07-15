@@ -53,6 +53,14 @@ const decodeControlOperation = (input: unknown, message: string) =>
     onExcessProperty: "error",
   })(input).pipe(Effect.mapError(() => new InvalidUsage({ message })));
 
+const newJobId = () => {
+  const submittedSecond = Math.floor(Date.now() / 1_000)
+    .toString(16)
+    .padStart(8, "0")
+    .slice(-8);
+  return `job-${submittedSecond}${randomBytes(2).toString("hex")}`;
+};
+
 const run = Command.make(
   "run",
   {
@@ -82,7 +90,7 @@ const run = Command.make(
         {
           version: 1,
           operation: "run",
-          jobId: `job-${randomBytes(6).toString("hex")}`,
+          jobId: newJobId(),
           instruction: resolvedInstruction,
           repositorySet: [],
         },
@@ -182,6 +190,7 @@ const get = Command.make(
             status: manifest.status,
             ...(manifest.outcome === undefined ? {} : { outcome: manifest.outcome }),
             ...(manifest.failure === undefined ? {} : { failure: manifest.failure }),
+            manifest,
           }),
         );
         return;
@@ -197,8 +206,27 @@ const get = Command.make(
         manifest.failure === undefined
           ? ""
           : `\nFailure: ${manifest.failure.code}: ${manifest.failure.message}`;
+      const repositories = manifest.submission.repositorySet
+        .map(({ repository }) => repository)
+        .join(", ");
+      const transitions = manifest.transitions
+        .map(({ status, timestamp }) => `${status}@${timestamp}`)
+        .join(" -> ");
+      const artifacts = [manifest.artifacts.transcript, manifest.artifacts.piSession]
+        .filter((artifact) => artifact !== undefined)
+        .join(", ");
       yield* Console.log(
-        `Job ${manifest.jobId}\nStatus: ${manifest.status}${renderedOutcome}${renderedFailure}`,
+        [
+          `Job ${manifest.jobId}`,
+          `Status: ${manifest.status}`,
+          `Instruction: ${manifest.submission.instruction}`,
+          `Repositories: ${repositories || "(empty)"}`,
+          `Submitted: ${manifest.audit.submittedAt} by ${manifest.audit.submittedBy}`,
+          `Transitions: ${transitions}`,
+          `Runtime: writer generation ${manifest.runtime.writerGeneration}${manifest.runtime.microvmId === undefined ? "" : `, MicroVM ${manifest.runtime.microvmId}`}`,
+          `Transcript cursor: ${manifest.transcript.highestCursor ?? "(none)"}`,
+          `Artifacts: ${artifacts || "(none)"}`,
+        ].join("\n") + renderedOutcome + renderedFailure,
       );
     }),
 );

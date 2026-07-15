@@ -1,30 +1,17 @@
 import { createHash } from "node:crypto";
+import type {
+  ControlCancelOperation,
+  ControlGetOperation,
+  ControlListOperation,
+  ControlRunOperation,
+  JobManifest,
+} from "../domain/schemas.js";
 
-export interface RunOperation {
-  readonly version: 1;
-  readonly operation: "run";
-  readonly jobId: string;
-  readonly instruction: string;
-  readonly repositorySet: ReadonlyArray<unknown>;
-}
-
-export interface CancelOperation {
-  readonly version: 1;
-  readonly operation: "cancel";
-  readonly jobId: string;
-}
-
-export interface GetOperation {
-  readonly version: 1;
-  readonly operation: "get";
-  readonly jobId: string;
-}
-
-type ResponseOutcome = {
-  readonly version: 1;
-  readonly kind: "response";
-  readonly response: string;
-};
+export type RunOperation = ControlRunOperation;
+export type CancelOperation = ControlCancelOperation;
+export type GetOperation = ControlGetOperation;
+export type ListOperation = ControlListOperation;
+export type JobStatus = JobManifest["status"];
 
 export type SettleOperation =
   | {
@@ -32,7 +19,7 @@ export type SettleOperation =
       readonly operation: "settle";
       readonly jobId: string;
       readonly status: "succeeded";
-      readonly outcome: ResponseOutcome;
+      readonly outcome: NonNullable<JobManifest["outcome"]>;
     }
   | {
       readonly version: 1;
@@ -42,46 +29,12 @@ export type SettleOperation =
       readonly failure: { readonly code: string; readonly message: string };
     };
 
-export interface ListOperation {
-  readonly version: 1;
-  readonly operation: "list";
-  readonly status?: JobStatus;
-  readonly limit: number;
-  readonly cursor?: string;
-}
-
 export type JobOperation =
   | RunOperation
   | GetOperation
   | ListOperation
   | CancelOperation
   | SettleOperation;
-
-export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
-
-export interface JobManifest {
-  readonly version: 1;
-  readonly jobId: string;
-  readonly submission: {
-    readonly canonicalHash: string;
-    readonly instruction: string;
-    readonly repositorySet: ReadonlyArray<unknown>;
-  };
-  readonly status: JobStatus;
-  readonly transitions: ReadonlyArray<{
-    readonly status: JobStatus;
-    readonly timestamp: string;
-  }>;
-  readonly audit: {
-    readonly submittedAt: string;
-    readonly submittedBy: string;
-  };
-  readonly runtime: { readonly writerGeneration: number };
-  readonly transcript: { readonly highestCursor: null };
-  readonly failure?: { readonly code: string; readonly message: string };
-  readonly outcome?: ResponseOutcome;
-  readonly artifacts: Record<string, never>;
-}
 
 export interface StoredManifest {
   readonly manifest: JobManifest;
@@ -123,6 +76,24 @@ export class InvalidCursor extends Error {
   constructor() {
     super("Invalid Job list cursor");
     this.name = "InvalidCursor";
+  }
+}
+
+export class JobNotFoundError extends Error {
+  readonly code = "job_not_found";
+
+  constructor(readonly jobId: string) {
+    super(`Job ${jobId} not found`);
+    this.name = "JobNotFoundError";
+  }
+}
+
+export class JobNotCancellableError extends Error {
+  readonly code = "job_not_cancellable";
+
+  constructor(readonly jobId: string) {
+    super(`Job ${jobId} is not cancellable`);
+    this.name = "JobNotCancellableError";
   }
 }
 
@@ -210,36 +181,59 @@ const decodeCursor = (cursor: string, status: JobStatus | undefined) => {
   }
 };
 
+export const paginateJobManifests = (
+  manifests: ReadonlyArray<JobManifest>,
+  operation: ListOperation,
+): JobListPage => {
+  const offset = operation.cursor === undefined ? 0 : decodeCursor(operation.cursor, operation.status);
+  const retained = manifests
+    .filter((manifest) => operation.status === undefined || manifest.status === operation.status)
+    .sort(
+      (left, right) =>
+        right.audit.submittedAt.localeCompare(left.audit.submittedAt) ||
+        right.jobId.localeCompare(left.jobId),
+    );
+  const jobs = retained.slice(offset, offset + operation.limit);
+  const nextOffset = offset + jobs.length;
+  return {
+    jobs,
+    ...(nextOffset < retained.length
+      ? { nextCursor: encodeCursor(nextOffset, operation.status) }
+      : {}),
+  };
+};
+
+export const cancelJobManifest = (manifest: JobManifest, timestamp: string): JobManifest => {
+  if (manifest.status === "cancelled") return manifest;
+  if (manifest.status !== "queued" && manifest.status !== "running") {
+    throw new JobNotCancellableError(manifest.jobId);
+  }
+  return {
+    ...manifest,
+    status: "cancelled",
+    transitions: [...manifest.transitions, { status: "cancelled", timestamp }],
+    failure: { code: "cancelled", message: "Job cancelled by user" },
+  };
+};
+
 export const makeJobController = (dependencies: JobControllerDependencies): JobController => {
   const handle = async (operation: JobOperation): Promise<JobManifest | JobListPage> => {
     if (operation.operation === "list") {
-      const offset = operation.cursor === undefined ? 0 : decodeCursor(operation.cursor, operation.status);
-      const retained = (await dependencies.store.list())
-        .map(({ manifest }) => manifest)
-        .filter((manifest) => operation.status === undefined || manifest.status === operation.status)
-        .sort((left, right) =>
-          right.audit.submittedAt.localeCompare(left.audit.submittedAt) ||
-          right.jobId.localeCompare(left.jobId),
-        );
-      const jobs = retained.slice(offset, offset + operation.limit);
-      const nextOffset = offset + jobs.length;
-      return {
-        jobs,
-        ...(nextOffset < retained.length
-          ? { nextCursor: encodeCursor(nextOffset, operation.status) }
-          : {}),
-      };
+      return paginateJobManifests(
+        (await dependencies.store.list()).map(({ manifest }) => manifest),
+        operation,
+      );
     }
 
     if (operation.operation === "get") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new Error(`Job ${operation.jobId} not found`);
+      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
       return existing.manifest;
     }
 
     if (operation.operation === "settle") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new Error(`Job ${operation.jobId} not found`);
+      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
       if (["succeeded", "failed", "cancelled"].includes(existing.manifest.status)) {
         throw new StaleManifest(operation.jobId);
       }
@@ -265,26 +259,19 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
 
     if (operation.operation === "cancel") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new Error(`Job ${operation.jobId} not found`);
-      if (existing.manifest.status === "cancelled") return existing.manifest;
-      if (existing.manifest.status !== "queued" && existing.manifest.status !== "running") {
-        throw new Error(`Job ${operation.jobId} is not cancellable`);
-      }
-      const cancelled: JobManifest = {
-        ...existing.manifest,
-        status: "cancelled",
-        transitions: [
-          ...existing.manifest.transitions,
-          { status: "cancelled", timestamp: dependencies.now() },
-        ],
-        failure: { code: "cancelled", message: "Job cancelled by user" },
-      };
+      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
+      const cancelled = cancelJobManifest(existing.manifest, dependencies.now());
+      if (cancelled === existing.manifest) return existing.manifest;
       const replaced = await dependencies.store.replace(
         operation.jobId,
         existing.etag,
         cancelled,
       );
-      if (replaced === undefined) throw new StaleManifest(operation.jobId);
+      if (replaced === undefined) {
+        const winner = await dependencies.store.read(operation.jobId);
+        if (winner?.manifest.status === "cancelled") return winner.manifest;
+        throw new StaleManifest(operation.jobId);
+      }
       return replaced.manifest;
     }
 
