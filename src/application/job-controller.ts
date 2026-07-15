@@ -97,6 +97,10 @@ export class InMemoryManifestStore implements ManifestStoreService {
     return this.#manifests.size;
   }
 
+  snapshot(jobId: string): StoredManifest | undefined {
+    return this.#manifests.get(jobId);
+  }
+
   readonly create = Effect.fn("ManifestStore.Memory.create")((manifest: JobManifest) =>
     Effect.sync(() => {
       if (this.#manifests.has(manifest.jobId)) return undefined;
@@ -132,6 +136,7 @@ export interface JobControllerDependencies {
   readonly now: Effect.Effect<string>;
   readonly submittedBy: Effect.Effect<string>;
   readonly wakeLaunch: (jobId: string) => Effect.Effect<void, ManifestPersistenceError>;
+  readonly requestTermination: (microvmId: string) => Effect.Effect<void, ManifestPersistenceError>;
 }
 
 export interface JobControllerService {
@@ -234,7 +239,10 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
     if (operation.operation === "start") {
       const existing = yield* dependencies.store.read(operation.jobId);
       if (existing === undefined) return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
-      if (existing.manifest.status === "cancelled") return existing.manifest;
+      if (existing.manifest.status === "cancelled") {
+        yield* dependencies.requestTermination(operation.microvmId);
+        return existing.manifest;
+      }
       if (existing.manifest.status !== "queued") {
         return yield* Effect.fail(new StaleManifest({ jobId: operation.jobId }));
       }
@@ -257,7 +265,10 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
       );
       if (replaced === undefined) {
         const winner = yield* dependencies.store.read(operation.jobId);
-        if (winner?.manifest.status === "cancelled") return winner.manifest;
+        if (winner?.manifest.status === "cancelled") {
+          yield* dependencies.requestTermination(operation.microvmId);
+          return winner.manifest;
+        }
         return yield* Effect.fail(new StaleManifest({ jobId: operation.jobId }));
       }
       return replaced.manifest;
@@ -294,6 +305,7 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
       if (existing === undefined) return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
       const cancelled = yield* cancelJobManifest(existing.manifest, yield* dependencies.now);
       if (cancelled === existing.manifest) return existing.manifest;
+      const microvmId = existing.manifest.runtime.microvmId;
       const replaced = yield* dependencies.store.replace(
         operation.jobId,
         existing.etag,
@@ -304,6 +316,7 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
         if (winner?.manifest.status === "cancelled") return winner.manifest;
         return yield* Effect.fail(new StaleManifest({ jobId: operation.jobId }));
       }
+      if (microvmId !== undefined) yield* dependencies.requestTermination(microvmId);
       return replaced.manifest;
     }
 
