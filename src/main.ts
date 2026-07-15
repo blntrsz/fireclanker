@@ -54,7 +54,7 @@ const decodeOperation = <A, I, R>(schema: Schema.Codec<A, I, R>, input: unknown,
 
 const repositoryFromRemote = (remote: string): string | undefined => {
   const trimmed = remote.trim().replace(/\.git$/, "");
-  const https = trimmed.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
+  const https = trimmed.match(/^https:\/\/(?:[^@/]+@)?github\.com\/([^/]+)\/([^/]+)$/i);
   if (https !== null) return `${https[1]}/${https[2]}`.toLowerCase();
   const ssh = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+)$/i);
   if (ssh !== null) return `${ssh[1]}/${ssh[2]}`.toLowerCase();
@@ -62,6 +62,7 @@ const repositoryFromRemote = (remote: string): string | undefined => {
 };
 
 const inferredRepositorySet = (): ReadonlyArray<{ readonly repository: string }> => {
+  if (FIRECLANKER_COMPOSITION === "test") return [];
   const result = Bun.spawnSync(["git", "remote", "get-url", "origin"], {
     cwd: process.cwd(),
     stdout: "pipe",
