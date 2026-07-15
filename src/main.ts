@@ -1,10 +1,30 @@
 import { BunRuntime, BunServices } from "@effect/platform-bun";
 import { Console, Effect, Option, Schema } from "effect";
 import { Argument, CliError, CliOutput, Command, Flag } from "effect/unstable/cli";
-import { FileSystemProcess, InvalidUsage, JobControl } from "./application/services.js";
-import { DeterministicJobControl } from "./composition/deterministic.js";
-import { ProductionJobControl } from "./composition/production.js";
-import { PlatformFileSystemProcess } from "./composition/platform.js";
+import {
+  ConfigurationSource,
+  ConfirmationRequired,
+  DeploymentCore,
+  FileSystemProcess,
+  GitHubTokenRequired,
+  InvalidUsage,
+  JobControl,
+  TerminalInteraction,
+} from "./application/services.js";
+import {
+  DeterministicDeploymentCore,
+  DeterministicJobControl,
+} from "./composition/deterministic.js";
+import {
+  ProductionDeploymentCore,
+  ProductionJobControl,
+} from "./composition/production.js";
+import {
+  PlatformConfigurationSource,
+  PlatformFileSystemProcess,
+  PlatformTerminalInteraction,
+} from "./composition/platform.js";
+import type { DeploymentPlan } from "./domain/deployment.js";
 import {
   CliEventSchema,
   ControlOperationSchema,
@@ -174,8 +194,102 @@ const get = Command.make(
 
 const list = Command.make("list");
 const cancel = Command.make("cancel");
-const deploy = Command.make("deploy");
-const destroy = Command.make("destroy");
+
+const renderPlan = (plan: DeploymentPlan) =>
+  [
+    `${plan.operation === "deploy" ? "Deployment" : "Destruction"} plan: ${plan.action}`,
+    `Deployment: ${plan.identity.name}`,
+    `Identity: ${plan.identity.accountId}/${plan.identity.region}/${plan.identity.name}`,
+    `Portable state: s3://${plan.bootstrapBucket}/${plan.statePrefix}`,
+    ...plan.resources.map((resource) => `  ${plan.operation === "destroy" ? "-" : "+"} ${resource}`),
+    plan.operation === "destroy"
+      ? `Preserve shared bootstrap bucket: ${plan.bootstrapBucket}`
+      : `Alchemy revision: ${plan.alchemyRevision}`,
+  ].join("\n");
+
+const jsonPlan = (plan: DeploymentPlan) =>
+  JSON.stringify({
+    version: 1,
+    event: "deployment-plan",
+    operation: plan.operation,
+    action: plan.action,
+    deployment: plan.identity,
+    bootstrapBucket: plan.bootstrapBucket,
+    statePrefix: plan.statePrefix,
+    resources: plan.resources,
+    alchemyRevision: plan.alchemyRevision,
+  });
+
+const requireConfirmation = (plan: DeploymentPlan, yes: boolean, json: boolean) =>
+  Effect.gen(function* () {
+    if (yes) return;
+    const terminal = yield* TerminalInteraction;
+    const interactive = yield* terminal.isInteractive;
+    if (!json && interactive && (yield* terminal.confirm(`Apply ${plan.operation} plan?`))) return;
+    return yield* new ConfirmationRequired({
+      message: `Confirmation required for Deployment ${plan.identity.name}; pass --yes`,
+    });
+  });
+
+const deploymentCommand = (operation: "deploy" | "destroy") =>
+  Command.make(
+    operation,
+    {
+      yes: Flag.boolean("yes"),
+      githubTokenStdin: Flag.boolean("github-token-stdin"),
+    },
+    ({ githubTokenStdin, yes }) =>
+      Effect.gen(function* () {
+        const globals = yield* rootCommand;
+        if (operation === "destroy" && githubTokenStdin) {
+          return yield* new InvalidUsage({
+            message: "--github-token-stdin is only valid with deploy",
+          });
+        }
+        const source = yield* ConfigurationSource;
+        const configuration = yield* source.load(Option.getOrUndefined(globals.config));
+        const core = yield* DeploymentCore;
+        const identity = yield* core.resolveIdentity(configuration);
+        const plan = yield* core.plan(operation, identity, configuration, githubTokenStdin);
+
+        yield* Console.log(globals.json ? jsonPlan(plan) : renderPlan(plan));
+        yield* requireConfirmation(plan, yes, globals.json);
+
+        if (operation === "destroy") {
+          yield* core.destroy(plan);
+          if (!globals.json) yield* Console.log(`Destroyed Deployment ${identity.name}`);
+          return;
+        }
+
+        let githubToken: string | undefined;
+        if (githubTokenStdin) {
+          githubToken = (yield* Effect.promise(() => Bun.stdin.text())).trim();
+          if (githubToken.length === 0) {
+            return yield* new GitHubTokenRequired({ message: "GitHub token cannot be empty" });
+          }
+        } else if (plan.requiresGitHubToken) {
+          const terminal = yield* TerminalInteraction;
+          if (yield* terminal.isInteractive) {
+            githubToken = yield* terminal.readSecret("GitHub token: ");
+          }
+        }
+
+        if (plan.requiresGitHubToken && githubToken === undefined) {
+          return yield* new GitHubTokenRequired({
+            message: "First deployment requires a GitHub token; pass --github-token-stdin",
+          });
+        }
+
+        yield* core.apply(plan, configuration, githubToken);
+        yield* core.verifyControlAlias(identity);
+        if (!globals.json) {
+          yield* Console.log(`Deployed ${identity.name}; verified Control Lambda live alias`);
+        }
+      }),
+  );
+
+const deploy = deploymentCommand("deploy");
+const destroy = deploymentCommand("destroy");
 
 const app = rootCommand.pipe(Command.withSubcommands([run, get, list, cancel, deploy, destroy]));
 
@@ -224,7 +338,15 @@ const program = commandProgram.pipe(
             ? "deployment_unavailable"
             : tagged._tag === "InvalidUsage"
               ? "invalid_usage"
-              : "command_failed";
+              : tagged._tag === "InvalidConfiguration"
+                ? "invalid_configuration"
+                : tagged._tag === "ConfirmationRequired"
+                  ? "confirmation_required"
+                  : tagged._tag === "GitHubTokenRequired"
+                    ? "github_token_required"
+                    : tagged._tag === "DeploymentOperationFailure"
+                      ? "deployment_failed"
+                      : "command_failed";
       const message =
         tagged._tag === "JobNotFound" && "jobId" in tagged
           ? `Job ${String(tagged.jobId)} not found`
@@ -234,13 +356,26 @@ const program = commandProgram.pipe(
           ? `${jsonLine({ version: 1, event: "error", code, message })}\n`
           : `${message}\n`,
       );
-      process.exitCode = tagged._tag === "InvalidUsage" ? 2 : 1;
+      process.exitCode =
+        tagged._tag === "InvalidUsage" ||
+        tagged._tag === "InvalidConfiguration" ||
+        tagged._tag === "ConfirmationRequired" ||
+        tagged._tag === "GitHubTokenRequired"
+          ? 2
+          : 1;
     }),
   ),
   Effect.provide(
     FIRECLANKER_COMPOSITION === "test" ? DeterministicJobControl : ProductionJobControl,
   ),
+  Effect.provide(
+    FIRECLANKER_COMPOSITION === "test"
+      ? DeterministicDeploymentCore
+      : ProductionDeploymentCore,
+  ),
   Effect.provide(PlatformFileSystemProcess),
+  Effect.provide(PlatformConfigurationSource),
+  Effect.provide(PlatformTerminalInteraction),
   Effect.provide(BunServices.layer),
 );
 

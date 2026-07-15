@@ -1,7 +1,22 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
-import { JobControl, JobNotFound, Pi, Time } from "../application/services.js";
+import {
+  DeploymentCore,
+  DeploymentOperationFailure,
+  JobControl,
+  JobNotFound,
+  Pi,
+  Time,
+} from "../application/services.js";
+import {
+  ALCHEMY_SOURCE_REVISION,
+  deploymentKey,
+  deploymentResources,
+  deriveDeploymentPlan,
+  type DeploymentConfiguration,
+  type DeploymentIdentity,
+} from "../domain/deployment.js";
 import {
   ExecutionTranscriptEventSchema,
   JobManifestSchema,
@@ -186,4 +201,110 @@ const JobControlFromDeterministicServices = Layer.effect(
 
 export const DeterministicJobControl = JobControlFromDeterministicServices.pipe(
   Layer.provide([DeterministicPi, DeterministicTime]),
+);
+
+interface PersistedDeployment {
+  readonly configuration: DeploymentConfiguration;
+  readonly tokenVersion: number;
+  readonly controlAlias: "live";
+}
+
+type DeploymentState = Record<string, PersistedDeployment>;
+
+const deploymentStatePath = () => join(stateDirectory(), "deployments.json");
+
+const readDeploymentState = async (): Promise<DeploymentState> => {
+  const file = Bun.file(deploymentStatePath());
+  return (await file.exists()) ? ((await file.json()) as DeploymentState) : {};
+};
+
+const writeDeploymentState = async (state: DeploymentState) => {
+  await mkdir(stateDirectory(), { recursive: true });
+  await Bun.write(deploymentStatePath(), JSON.stringify(state));
+};
+
+const sameConfiguration = (left: DeploymentConfiguration, right: DeploymentConfiguration) =>
+  JSON.stringify(left) === JSON.stringify(right);
+
+const deploymentFailure = (error: unknown) =>
+  error instanceof DeploymentOperationFailure
+    ? error
+    : new DeploymentOperationFailure({
+        message: error instanceof Error ? error.message : "Deployment operation failed",
+      });
+
+export const DeterministicDeploymentCore = Layer.effect(
+  DeploymentCore,
+  Effect.succeed({
+    resolveIdentity: (configuration: DeploymentConfiguration) =>
+      Effect.succeed({
+        accountId: "123456789012",
+        region: configuration.region,
+        name: configuration.name,
+      }),
+    plan: (operation, identity, configuration, rotateGitHubToken) =>
+      Effect.tryPromise({
+        try: async () => {
+          const state = await readDeploymentState();
+          const existing = state[deploymentKey(identity)];
+          const derived = deriveDeploymentPlan({
+            operation,
+            exists: existing !== undefined,
+            configurationMatches:
+              existing !== undefined && sameConfiguration(existing.configuration, configuration),
+            rotateGitHubToken,
+          });
+          return {
+            operation,
+            ...derived,
+            identity,
+            bootstrapBucket: `alchemy-assets-${identity.accountId}-${identity.region}-an`,
+            statePrefix: `deployments/${identity.name}/`,
+            resources: deploymentResources(identity.name),
+            alchemyRevision: ALCHEMY_SOURCE_REVISION,
+          } as const;
+        },
+        catch: deploymentFailure,
+      }),
+    apply: (plan, configuration, githubToken) =>
+      Effect.tryPromise({
+        try: async () => {
+          const state = await readDeploymentState();
+          const key = deploymentKey(plan.identity);
+          const existing = state[key];
+          if (plan.action === "no-op" && existing !== undefined && githubToken === undefined) {
+            return { tokenVersion: existing.tokenVersion };
+          }
+          if (existing === undefined && githubToken === undefined) {
+            throw new DeploymentOperationFailure({
+              message: "First deployment requires a GitHub token; pass --github-token-stdin",
+            });
+          }
+          const tokenVersion = (existing?.tokenVersion ?? 0) + (githubToken === undefined ? 0 : 1);
+          state[key] = { configuration, tokenVersion, controlAlias: "live" };
+          await writeDeploymentState(state);
+          return { tokenVersion };
+        },
+        catch: deploymentFailure,
+      }),
+    destroy: (plan) =>
+      Effect.tryPromise({
+        try: async () => {
+          const state = await readDeploymentState();
+          delete state[deploymentKey(plan.identity)];
+          await writeDeploymentState(state);
+        },
+        catch: deploymentFailure,
+      }),
+    verifyControlAlias: (identity: DeploymentIdentity) =>
+      Effect.tryPromise({
+        try: async () => {
+          const state = await readDeploymentState();
+          if (state[deploymentKey(identity)]?.controlAlias !== "live") {
+            throw new Error(`Control Lambda live alias verification failed for ${identity.name}`);
+          }
+        },
+        catch: deploymentFailure,
+      }),
+  }),
 );
