@@ -28,12 +28,12 @@ import {
 import type { DeploymentPlan } from "./domain/deployment.js";
 import {
   CliEventSchema,
-  ControlOperationSchema,
-  type ControlGetOperation,
-  type ControlListOperation,
-  type ControlCancelOperation,
-  type ControlRunOperation,
-  type ControlTranscriptOperation,
+  ControlCancelOperationSchema,
+  ControlGetOperationSchema,
+  ControlListOperationSchema,
+  ControlRunOperationSchema,
+  ControlTranscriptOperationSchema,
+  type CliEvent,
   type ExecutionTranscriptEvent,
 } from "./domain/schemas.js";
 
@@ -46,10 +46,9 @@ const rootCommand = Command.make("fireclanker").pipe(
   }),
 );
 
-const jsonLine = (event: unknown): string =>
-  JSON.stringify(Schema.decodeUnknownSync(CliEventSchema, { onExcessProperty: "error" })(event));
-const decodeControlOperation = (input: unknown, message: string) =>
-  Schema.decodeUnknownEffect(ControlOperationSchema, {
+const jsonLine = (event: CliEvent): string => JSON.stringify(CliEventSchema.make(event));
+const decodeOperation = <A, I, R>(schema: Schema.Codec<A, I, R>, input: unknown, message: string) =>
+  Schema.decodeUnknownEffect(schema, {
     onExcessProperty: "error",
   })(input).pipe(Effect.mapError(() => new InvalidUsage({ message })));
 
@@ -83,10 +82,16 @@ const run = Command.make(
         });
       }
       const source = yield* FileSystemProcess;
-      const resolvedInstruction =
-        positionalInstruction ?? (yield* source.readInstruction(instructionFile!));
+      let resolvedInstruction = positionalInstruction;
+      if (resolvedInstruction === undefined) {
+        if (instructionFile === undefined) {
+          return yield* new InvalidUsage({ message: "Missing required argument: instruction" });
+        }
+        resolvedInstruction = yield* source.readInstruction(instructionFile);
+      }
       const control = yield* JobControl;
-      const operation = (yield* decodeControlOperation(
+      const operation = yield* decodeOperation(
+        ControlRunOperationSchema,
         {
           version: 1,
           operation: "run",
@@ -95,7 +100,7 @@ const run = Command.make(
           repositorySet: [],
         },
         "Invalid run operation",
-      )) as ControlRunOperation;
+      );
       const manifest = yield* control.submit(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
@@ -123,7 +128,7 @@ const renderTranscriptEvent = (event: ExecutionTranscriptEvent): string => {
     : `[${event.timestamp}] Change Set: ${event.outcome.summary}`;
 };
 
-const jsonTranscriptEvent = (event: ExecutionTranscriptEvent) =>
+const jsonTranscriptEvent = (event: ExecutionTranscriptEvent): CliEvent =>
   event.type === "status"
     ? {
         version: 1,
@@ -153,14 +158,15 @@ const get = Command.make(
       const globals = yield* rootCommand;
       const control = yield* JobControl;
       if (watch) {
-        const operation = (yield* decodeControlOperation(
+        const operation = yield* decodeOperation(
+          ControlTranscriptOperationSchema,
           {
             version: 1,
             operation: "transcript",
             jobId,
           },
           `Invalid Job ID: ${jobId}`,
-        )) as ControlTranscriptOperation;
+        );
         const events = yield* control.watch(operation, Option.getOrUndefined(globals.config));
         yield* Console.log(
           events
@@ -172,14 +178,15 @@ const get = Command.make(
         return;
       }
 
-      const operation = (yield* decodeControlOperation(
+      const operation = yield* decodeOperation(
+        ControlGetOperationSchema,
         {
           version: 1,
           operation: "get",
           jobId,
         },
         `Invalid Job ID: ${jobId}`,
-      )) as ControlGetOperation;
+      );
       const manifest = yield* control.get(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
@@ -244,7 +251,8 @@ const list = Command.make(
     Effect.gen(function* () {
       const globals = yield* rootCommand;
       const control = yield* JobControl;
-      const operation = (yield* decodeControlOperation(
+      const operation = yield* decodeOperation(
+        ControlListOperationSchema,
         {
           version: 1,
           operation: "list",
@@ -253,7 +261,7 @@ const list = Command.make(
           ...(Option.isNone(cursor) ? {} : { cursor: cursor.value }),
         },
         "Invalid Job list arguments",
-      )) as ControlListOperation;
+      );
       const page = yield* control.list(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
@@ -285,10 +293,11 @@ const cancel = Command.make(
     Effect.gen(function* () {
       const globals = yield* rootCommand;
       const control = yield* JobControl;
-      const operation = (yield* decodeControlOperation(
+      const operation = yield* decodeOperation(
+        ControlCancelOperationSchema,
         { version: 1, operation: "cancel", jobId },
         `Invalid Job ID: ${jobId}`,
-      )) as ControlCancelOperation;
+      );
       const manifest = yield* control.cancel(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
@@ -440,45 +449,48 @@ const program = commandProgram.pipe(
         process.exitCode = 2;
         return;
       }
-      const tagged = error as { readonly _tag?: string; readonly message?: string };
+      const tagged = typeof error === "object" && error !== null ? error : {};
+      const tag = "_tag" in tagged && typeof tagged._tag === "string" ? tagged._tag : undefined;
+      const taggedMessage =
+        "message" in tagged && typeof tagged.message === "string" ? tagged.message : undefined;
       const code =
-        tagged._tag === "JobNotFound"
+        tag === "JobNotFound"
           ? "job_not_found"
-          : tagged._tag === "JobNotCancellable"
+          : tag === "JobNotCancellable"
             ? "job_not_cancellable"
-            : tagged._tag === "JobIdempotencyConflict"
+            : tag === "JobIdempotencyConflict"
               ? "idempotency_conflict"
-              : tagged._tag === "InvalidCursor"
+              : tag === "InvalidCursor"
                 ? "invalid_cursor"
-          : tagged._tag === "DeploymentUnavailable"
+          : tag === "DeploymentUnavailable"
             ? "deployment_unavailable"
-            : tagged._tag === "InvalidUsage"
+            : tag === "InvalidUsage"
               ? "invalid_usage"
-              : tagged._tag === "InvalidConfiguration"
+              : tag === "InvalidConfiguration"
                 ? "invalid_configuration"
-                : tagged._tag === "ConfirmationRequired"
+                : tag === "ConfirmationRequired"
                   ? "confirmation_required"
-                  : tagged._tag === "GitHubTokenRequired"
+                  : tag === "GitHubTokenRequired"
                     ? "github_token_required"
-                    : tagged._tag === "DeploymentOperationFailure"
+                    : tag === "DeploymentOperationFailure"
                       ? "deployment_failed"
                       : "command_failed";
       const message =
-        (tagged._tag === "JobNotFound" || tagged._tag === "JobNotCancellable") && "jobId" in tagged
-          ? tagged._tag === "JobNotFound"
+        (tag === "JobNotFound" || tag === "JobNotCancellable") && "jobId" in tagged
+          ? tag === "JobNotFound"
             ? `Job ${String(tagged.jobId)} not found`
             : `Job ${String(tagged.jobId)} is not cancellable`
-          : tagged.message || "Command failed";
+          : taggedMessage || "Command failed";
       process.stderr.write(
         jsonRequested
           ? `${jsonLine({ version: 1, event: "error", code, message })}\n`
           : `${message}\n`,
       );
       process.exitCode =
-        tagged._tag === "InvalidUsage" ||
-        tagged._tag === "InvalidConfiguration" ||
-        tagged._tag === "ConfirmationRequired" ||
-        tagged._tag === "GitHubTokenRequired"
+        tag === "InvalidUsage" ||
+        tag === "InvalidConfiguration" ||
+        tag === "ConfirmationRequired" ||
+        tag === "GitHubTokenRequired"
           ? 2
           : 1;
     }),

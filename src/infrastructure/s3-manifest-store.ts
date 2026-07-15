@@ -5,18 +5,30 @@ import {
   S3Client,
   type S3ClientConfig,
 } from "@aws-sdk/client-s3";
-import { Schema } from "effect";
-import type {
-  ManifestStore,
-  StoredManifest,
-} from "../application/job-controller.js";
+import { Effect, Schema } from "effect";
+import type { ManifestStoreService, StoredManifest } from "../application/job-controller.js";
+import { ManifestPersistenceError } from "../application/services.js";
 import { JobManifestSchema, type JobManifest } from "../domain/schemas.js";
 
-const decodeManifest = Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" });
+const metadataStatus = (error: unknown): number | undefined => {
+  if (typeof error !== "object" || error === null || !("$metadata" in error)) return undefined;
+  const metadata = error.$metadata;
+  if (typeof metadata !== "object" || metadata === null || !("httpStatusCode" in metadata)) {
+    return undefined;
+  }
+  return typeof metadata.httpStatusCode === "number" ? metadata.httpStatusCode : undefined;
+};
 
-const isPreconditionFailure = (error: unknown) =>
-  (error as { readonly $metadata?: { readonly httpStatusCode?: number } }).$metadata
-    ?.httpStatusCode === 412 || (error as { readonly name?: string }).name === "PreconditionFailed";
+const errorName = (error: unknown): string | undefined =>
+  typeof error === "object" && error !== null && "name" in error && typeof error.name === "string"
+    ? error.name
+    : undefined;
+
+const persistenceError = (operation: string, cause: unknown) =>
+  new ManifestPersistenceError({
+    operation,
+    message: cause instanceof Error ? cause.message : `S3 ${operation} failed`,
+  });
 
 const manifestKey = (manifest: JobManifest) => {
   const submittedSecond = Number.parseInt(manifest.jobId.slice(4, 12), 16);
@@ -24,7 +36,7 @@ const manifestKey = (manifest: JobManifest) => {
   return `jobs/${date}/${manifest.jobId}/manifest.json`;
 };
 
-export class S3ManifestStore implements ManifestStore {
+export class S3ManifestStore implements ManifestStoreService {
   readonly #client: S3Client;
   readonly #keys = new Map<string, string>();
 
@@ -35,95 +47,136 @@ export class S3ManifestStore implements ManifestStore {
     this.#client = new S3Client(configuration);
   }
 
-  async #allKeys() {
-    const keys: string[] = [];
-    let continuationToken: string | undefined;
-    do {
-      const page = await this.#client.send(
-        new ListObjectsV2Command({
-          Bucket: this.bucket,
-          Prefix: "jobs/",
-          ...(continuationToken === undefined ? {} : { ContinuationToken: continuationToken }),
-        }),
-      );
-      for (const object of page.Contents ?? []) {
-        if (object.Key?.endsWith("/manifest.json")) keys.push(object.Key);
-      }
-      continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
-    } while (continuationToken !== undefined);
-    return keys;
-  }
+  readonly #allKeys = Effect.fn("ManifestStore.S3.allKeys")(() =>
+    Effect.tryPromise({
+      try: async () => {
+        const keys: string[] = [];
+        let continuationToken: string | undefined;
+        do {
+          const page = await this.#client.send(
+            new ListObjectsV2Command({
+              Bucket: this.bucket,
+              Prefix: "jobs/",
+              ...(continuationToken === undefined ? {} : { ContinuationToken: continuationToken }),
+            }),
+          );
+          for (const object of page.Contents ?? []) {
+            if (object.Key?.endsWith("/manifest.json")) keys.push(object.Key);
+          }
+          continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
+        } while (continuationToken !== undefined);
+        return keys;
+      },
+      catch: (cause) => persistenceError("list", cause),
+    }),
+  );
 
-  async #readKey(key: string): Promise<StoredManifest | undefined> {
-    try {
-      const object = await this.#client.send(
-        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
-      );
-      const body = await object.Body?.transformToString();
-      if (body === undefined || object.ETag === undefined) return undefined;
-      const manifest = decodeManifest(JSON.parse(body)) as JobManifest;
-      this.#keys.set(manifest.jobId, key);
-      return { manifest, etag: object.ETag };
-    } catch (error) {
-      if ((error as { readonly $metadata?: { readonly httpStatusCode?: number } }).$metadata?.httpStatusCode === 404) {
-        return undefined;
-      }
-      throw error;
-    }
-  }
+  readonly #readKey = Effect.fn("ManifestStore.S3.readKey")(function* (
+    this: S3ManifestStore,
+    key: string,
+  ) {
+    const object = yield* Effect.tryPromise({
+      try: () => this.#client.send(new GetObjectCommand({ Bucket: this.bucket, Key: key })),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.catch((cause) =>
+        metadataStatus(cause) === 404
+          ? Effect.succeed(undefined)
+          : Effect.fail(persistenceError("read", cause)),
+      ),
+    );
+    if (object === undefined) return undefined;
+    const body = yield* Effect.tryPromise({
+      try: () => object.Body?.transformToString() ?? Promise.resolve(undefined),
+      catch: (cause) => persistenceError("read-body", cause),
+    });
+    if (body === undefined || object.ETag === undefined) return undefined;
+    const parsed = yield* Effect.try({
+      try: () => JSON.parse(body),
+      catch: (cause) => persistenceError("parse", cause),
+    });
+    const manifest = yield* Schema.decodeUnknownEffect(JobManifestSchema, {
+      onExcessProperty: "error",
+    })(parsed).pipe(Effect.mapError((cause) => persistenceError("decode", cause)));
+    this.#keys.set(manifest.jobId, key);
+    return { manifest, etag: object.ETag } satisfies StoredManifest;
+  });
 
-  async create(manifest: JobManifest) {
+  readonly create = Effect.fn("ManifestStore.S3.create")((manifest: JobManifest) => {
     const key = manifestKey(manifest);
-    try {
-      const result = await this.#client.send(
-        new PutObjectCommand({
-          Bucket: this.bucket,
-          Key: key,
-          Body: JSON.stringify(manifest),
-          ContentType: "application/json",
-          IfNoneMatch: "*",
-        }),
-      );
-      this.#keys.set(manifest.jobId, key);
-      return { manifest, etag: result.ETag ?? '"created"' };
-    } catch (error) {
-      if (isPreconditionFailure(error)) return undefined;
-      throw error;
-    }
-  }
+    return Effect.tryPromise({
+      try: () =>
+        this.#client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: JSON.stringify(manifest),
+            ContentType: "application/json",
+            IfNoneMatch: "*",
+          }),
+        ),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.map((result) => {
+        this.#keys.set(manifest.jobId, key);
+        return { manifest, etag: result.ETag ?? '"created"' } satisfies StoredManifest;
+      }),
+      Effect.catch((cause) =>
+        metadataStatus(cause) === 412 || errorName(cause) === "PreconditionFailed"
+          ? Effect.succeed(undefined)
+          : Effect.fail(persistenceError("create", cause)),
+      ),
+    );
+  });
 
-  async read(jobId: string) {
+  readonly read = Effect.fn("ManifestStore.S3.read")(function* (
+    this: S3ManifestStore,
+    jobId: string,
+  ) {
     const cached = this.#keys.get(jobId);
-    if (cached !== undefined) return this.#readKey(cached);
-    const key = (await this.#allKeys()).find((candidate) =>
+    if (cached !== undefined) return yield* this.#readKey(cached);
+    const key = (yield* this.#allKeys()).find((candidate) =>
       candidate.endsWith(`/${jobId}/manifest.json`),
     );
-    return key === undefined ? undefined : this.#readKey(key);
-  }
+    return key === undefined ? undefined : yield* this.#readKey(key);
+  });
 
-  async replace(jobId: string, expectedEtag: string, manifest: JobManifest) {
-    const existing = await this.read(jobId);
+  readonly replace = Effect.fn("ManifestStore.S3.replace")(function* (
+    this: S3ManifestStore,
+    jobId: string,
+    expectedEtag: string,
+    manifest: JobManifest,
+  ) {
+    const existing = yield* this.read(jobId);
     if (existing === undefined) return undefined;
-    const key = this.#keys.get(jobId)!;
-    try {
-      const result = await this.#client.send(
-        new PutObjectCommand({
-          Bucket: this.bucket,
-          Key: key,
-          Body: JSON.stringify(manifest),
-          ContentType: "application/json",
-          IfMatch: expectedEtag,
-        }),
-      );
-      return { manifest, etag: result.ETag ?? expectedEtag };
-    } catch (error) {
-      if (isPreconditionFailure(error)) return undefined;
-      throw error;
-    }
-  }
+    const key = this.#keys.get(jobId);
+    if (key === undefined) return yield* Effect.fail(persistenceError("replace", "Missing key"));
+    return yield* Effect.tryPromise({
+      try: () =>
+        this.#client.send(
+          new PutObjectCommand({
+            Bucket: this.bucket,
+            Key: key,
+            Body: JSON.stringify(manifest),
+            ContentType: "application/json",
+            IfMatch: expectedEtag,
+          }),
+        ),
+      catch: (cause) => cause,
+    }).pipe(
+      Effect.map((result) => ({ manifest, etag: result.ETag ?? expectedEtag })),
+      Effect.catch((cause) =>
+        metadataStatus(cause) === 412 || errorName(cause) === "PreconditionFailed"
+          ? Effect.succeed(undefined)
+          : Effect.fail(persistenceError("replace", cause)),
+      ),
+    );
+  });
 
-  async list() {
-    const manifests = await Promise.all((await this.#allKeys()).map((key) => this.#readKey(key)));
+  readonly list = Effect.fn("ManifestStore.S3.list")(function* (this: S3ManifestStore) {
+    const manifests = yield* Effect.forEach(yield* this.#allKeys(), (key) => this.#readKey(key), {
+      concurrency: "unbounded",
+    });
     return manifests.filter((manifest): manifest is StoredManifest => manifest !== undefined);
-  }
+  });
 }

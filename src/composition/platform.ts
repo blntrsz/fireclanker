@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { Effect, Layer, Schema } from "effect";
+import { Config, Effect, Layer, Option, Schema } from "effect";
 import {
   ConfigurationSource,
   FileSystemProcess,
@@ -10,10 +10,10 @@ import {
 } from "../application/services.js";
 import { supportedRegions, type DeploymentConfiguration } from "../domain/deployment.js";
 
-export const PlatformFileSystemProcess = Layer.effect(
+export const PlatformFileSystemProcess = Layer.succeed(
   FileSystemProcess,
-  Effect.succeed({
-    readInstruction: (path: string) =>
+  FileSystemProcess.of({
+    readInstruction: Effect.fn("FileSystemProcess.readInstruction")((path: string) =>
       Effect.tryPromise({
         try: () => (path === "-" ? Bun.stdin.text() : Bun.file(path).text()),
         catch: () =>
@@ -21,7 +21,7 @@ export const PlatformFileSystemProcess = Layer.effect(
             path,
             message: `Unable to read instruction from ${path}`,
           }),
-      }),
+      })),
   }),
 );
 
@@ -38,18 +38,17 @@ const ConfigurationDocumentSchema = Schema.Struct({
       Schema.isPattern(/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\/[a-z0-9._-]+$/i),
     ),
   ),
-  retentionDays: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
+  retentionDays: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
 });
 
 const decodeConfiguration = Schema.decodeUnknownSync(ConfigurationDocumentSchema, {
   onExcessProperty: "error",
 });
 
-const configurationPath = async (explicitPath: string | undefined) => {
+const configurationPath = async (explicitPath: string | undefined, home: string | undefined) => {
   if (explicitPath !== undefined) return resolve(explicitPath);
   const working = join(process.cwd(), "fireclanker.json");
   if (await Bun.file(working).exists()) return working;
-  const home = process.env.HOME;
   return join(home ?? "", ".config", "fireclanker", "fireclanker.json");
 };
 
@@ -65,13 +64,17 @@ const validateCatalog = (configuration: typeof ConfigurationDocumentSchema.Type)
   return canonical;
 };
 
-export const PlatformConfigurationSource = Layer.effect(
+export const PlatformConfigurationSource = Layer.succeed(
   ConfigurationSource,
-  Effect.succeed({
-    load: (explicitPath: string | undefined) =>
-      Effect.tryPromise({
+  ConfigurationSource.of({
+    load: Effect.fn("ConfigurationSource.load")(function* (explicitPath: string | undefined) {
+      const home = yield* Config.option(Config.string("HOME")).pipe(
+        Effect.map(Option.getOrUndefined),
+        Effect.mapError((error) => new InvalidConfiguration({ message: error.message })),
+      );
+      return yield* Effect.tryPromise({
         try: async (): Promise<DeploymentConfiguration> => {
-          const path = await configurationPath(explicitPath);
+          const path = await configurationPath(explicitPath, home);
           const file = Bun.file(path);
           if (!(await file.exists())) throw new Error(`Configuration not found at ${path}`);
           const decoded = decodeConfiguration(await file.json());
@@ -85,11 +88,12 @@ export const PlatformConfigurationSource = Layer.effect(
           new InvalidConfiguration({
             message: error instanceof Error ? error.message : "Invalid Deployment configuration",
           }),
-      }),
+      });
+    }),
   }),
 );
 
-const readHiddenLine = (message: string) =>
+const readHiddenLine = Effect.fn("TerminalInteraction.readSecret")((message: string) =>
   Effect.callback<string, GitHubTokenRequired>((resume) => {
     if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
       resume(
@@ -127,17 +131,17 @@ const readHiddenLine = (message: string) =>
       }
     };
     process.stdin.on("data", onData);
-  });
+  }));
 
-export const PlatformTerminalInteraction = Layer.effect(
+export const PlatformTerminalInteraction = Layer.succeed(
   TerminalInteraction,
-  Effect.succeed({
+  TerminalInteraction.of({
     isInteractive: Effect.sync(() => Boolean(process.stdin.isTTY && process.stdout.isTTY)),
-    confirm: (message: string) =>
+    confirm: Effect.fn("TerminalInteraction.confirm")((message: string) =>
       Effect.sync(() => {
         const answer = globalThis.prompt(`${message} [y/N]`);
         return answer?.trim().toLowerCase() === "y" || answer?.trim().toLowerCase() === "yes";
-      }),
+      })),
     readSecret: readHiddenLine,
   }),
 );

@@ -12,6 +12,7 @@ import {
   DeploymentCore,
   DeploymentOperationFailure,
   DeploymentUnavailable,
+  InvalidConfiguration,
   InvalidCursor,
   JobIdempotencyConflict,
   JobControl,
@@ -41,108 +42,123 @@ import {
   type ControlOperation,
 } from "../domain/schemas.js";
 
-const unavailable = () =>
+const unavailable = Effect.fn("JobControl.Production.unavailable")(() =>
   Effect.fail(
     new DeploymentUnavailable({
       message: "Deployment unavailable: no production Deployment adapter is configured",
     }),
-  );
+  ));
 
-class ControlInvocationError extends Error {
-  constructor(
-    readonly code: string,
-    message: string,
-    readonly jobId?: string,
-  ) {
-    super(message);
-  }
-}
+const ControlInvocationEnvelopeSchema = Schema.Union([
+  Schema.Struct({ version: Schema.Literal(1), ok: Schema.Literal(true), value: Schema.Unknown }),
+  Schema.Struct({
+    version: Schema.Literal(1),
+    ok: Schema.Literal(false),
+    error: Schema.Struct({ code: Schema.String, message: Schema.String }),
+  }),
+]);
 
-const controlInvocationFailure = (error: unknown) => {
-  if (error instanceof ControlInvocationError) {
-    if (error.code === "job_not_found") return new JobNotFound({ jobId: error.jobId ?? "unknown" });
-    if (error.code === "job_not_cancellable") {
-      return new JobNotCancellable({ jobId: error.jobId ?? "unknown" });
-    }
-    if (error.code === "idempotency_conflict") {
-      return new JobIdempotencyConflict({ jobId: error.jobId ?? "unknown", message: error.message });
-    }
-    if (error.code === "invalid_cursor") return new InvalidCursor({ message: error.message });
-  }
-  return new DeploymentUnavailable({
-    message: error instanceof Error ? error.message : "Control Lambda invocation failed",
+const unavailableFailure = (cause: unknown) =>
+  new DeploymentUnavailable({
+    message: cause instanceof Error ? cause.message : "Control Lambda invocation failed",
   });
+
+const controlFailure = (code: string, message: string, jobId: string | undefined) => {
+  if (code === "job_not_found") return new JobNotFound({ jobId: jobId ?? "unknown" });
+  if (code === "job_not_cancellable") return new JobNotCancellable({ jobId: jobId ?? "unknown" });
+  if (code === "idempotency_conflict") {
+    return new JobIdempotencyConflict({ jobId: jobId ?? "unknown", message });
+  }
+  if (code === "invalid_cursor") return new InvalidCursor({ message });
+  return new DeploymentUnavailable({ message });
 };
+
+const preserveJobControlError = (error: unknown) =>
+  error instanceof DeploymentUnavailable ||
+  error instanceof InvalidConfiguration ||
+  error instanceof JobNotFound ||
+  error instanceof JobNotCancellable ||
+  error instanceof JobIdempotencyConflict ||
+  error instanceof InvalidCursor
+    ? error
+    : unavailableFailure(error);
 
 export const ProductionJobControl = Layer.effect(
   JobControl,
   Effect.gen(function* () {
     const configurationSource = yield* ConfigurationSource;
-    const invoke = (operation: ControlOperation, configurationPath: string | undefined) =>
-      Effect.gen(function* () {
+    const invoke = Effect.fn("JobControl.Production.invoke")(function* (
+      operation: ControlOperation,
+      configurationPath: string | undefined,
+    ) {
         const configuration = yield* configurationSource.load(configurationPath);
-        return yield* Effect.tryPromise({
-          try: async () => {
-            let envelope: unknown = operation;
-            if (operation.operation === "run") {
-              const caller = await new STSClient({ region: configuration.region }).send(
-                new GetCallerIdentityCommand({}),
-              );
-              envelope = { ...operation, ...(caller.Arn === undefined ? {} : { submittedBy: caller.Arn }) };
-            }
-            const response = await new LambdaClient({ region: configuration.region }).send(
+        let envelope: unknown = operation;
+        if (operation.operation === "run") {
+          const caller = yield* Effect.tryPromise({
+            try: () => new STSClient({ region: configuration.region }).send(new GetCallerIdentityCommand({})),
+            catch: unavailableFailure,
+          });
+          envelope = { ...operation, ...(caller.Arn === undefined ? {} : { submittedBy: caller.Arn }) };
+        }
+        const response = yield* Effect.tryPromise({
+          try: () =>
+            new LambdaClient({ region: configuration.region }).send(
               new InvokeCommand({
                 FunctionName: `fireclanker-${configuration.name}-control`,
                 Qualifier: "live",
                 InvocationType: "RequestResponse",
                 Payload: Buffer.from(JSON.stringify(envelope)),
               }),
-            );
-            if (response.FunctionError !== undefined || response.Payload === undefined) {
-              throw new Error(response.FunctionError ?? "Control Lambda returned no payload");
-            }
-            const decoded = JSON.parse(Buffer.from(response.Payload).toString()) as {
-              version?: number;
-              ok?: boolean;
-              value?: unknown;
-              error?: { code?: string; message?: string };
-            };
-            if (decoded.version !== 1 || decoded.ok !== true) {
-              throw new ControlInvocationError(
-                decoded.error?.code ?? "control_operation_failed",
-                decoded.error?.message ?? "Control Lambda rejected the operation",
-                "jobId" in operation ? operation.jobId : undefined,
-              );
-            }
-            return decoded.value;
-          },
-          catch: controlInvocationFailure,
+            ),
+          catch: unavailableFailure,
         });
-      });
-
-    const decodeManifest = Schema.decodeUnknownSync(JobManifestSchema, {
-      onExcessProperty: "error",
+        const payload = response.Payload;
+        if (response.FunctionError !== undefined || payload === undefined) {
+          return yield* Effect.fail(
+            new DeploymentUnavailable({
+              message: response.FunctionError ?? "Control Lambda returned no payload",
+            }),
+          );
+        }
+        const parsed = yield* Effect.try({
+          try: () => JSON.parse(Buffer.from(payload).toString()),
+          catch: unavailableFailure,
+        });
+        const decoded = yield* Schema.decodeUnknownEffect(ControlInvocationEnvelopeSchema, {
+          onExcessProperty: "error",
+        })(parsed).pipe(Effect.mapError(unavailableFailure));
+        if (!decoded.ok) {
+          return yield* Effect.fail(
+            controlFailure(
+              decoded.error.code,
+              decoded.error.message,
+              "jobId" in operation ? operation.jobId : undefined,
+            ),
+          );
+        }
+        return decoded.value;
     });
     const invokeManifest = (
       operation: Exclude<ControlOperation, { readonly operation: "list" | "transcript" }>,
       configurationPath: string | undefined,
-    ) => invoke(operation, configurationPath).pipe(Effect.map(decodeManifest));
+    ) => invoke(operation, configurationPath).pipe(
+      Effect.flatMap((value) => Schema.decodeUnknownEffect(JobManifestSchema, {
+        onExcessProperty: "error",
+      })(value)),
+      Effect.mapError(preserveJobControlError),
+    );
 
-    return {
-      submit: (operation, configurationPath) =>
-        invokeManifest(operation, configurationPath),
-      get: (operation, configurationPath) =>
-        invokeManifest(operation, configurationPath),
-      list: (operation, configurationPath) =>
+    return JobControl.of({
+      submit: Effect.fn("JobControl.Production.submit")(invokeManifest),
+      get: Effect.fn("JobControl.Production.get")(invokeManifest),
+      list: Effect.fn("JobControl.Production.list")((operation, configurationPath) =>
         invoke(operation, configurationPath).pipe(
-          Effect.map((value) =>
-            Schema.decodeUnknownSync(JobListPageSchema, { onExcessProperty: "error" })(value),
-          ),
-        ),
-      cancel: (operation, configurationPath) =>
-        invokeManifest(operation, configurationPath),
+          Effect.flatMap((value) => Schema.decodeUnknownEffect(JobListPageSchema, { onExcessProperty: "error" })(value)),
+          Effect.mapError(preserveJobControlError),
+        )),
+      cancel: Effect.fn("JobControl.Production.cancel")(invokeManifest),
       watch: unavailable,
-    };
+    });
   }),
 );
 

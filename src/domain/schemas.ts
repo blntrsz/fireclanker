@@ -42,33 +42,39 @@ export const RepositoryTargetSchema = Schema.Union([
 
 export const RepositorySetMemberSchema = Schema.Struct({
   repository: RepositoryName,
-  target: Schema.optional(RepositoryTargetSchema),
+  target: Schema.optionalKey(RepositoryTargetSchema),
 });
 
-export const ControlOperationSchema = Schema.Union([
-  Schema.Struct({
+export const ControlRunOperationSchema = Schema.Struct({
     version: Version,
     operation: Schema.Literal("run"),
     jobId: JobIdSchema,
     instruction: Schema.String,
     repositorySet: Schema.Array(RepositorySetMemberSchema),
-    submittedBy: Schema.optional(Schema.String),
-  }),
-  Schema.Struct({ version: Version, operation: Schema.Literal("get"), jobId: JobIdSchema }),
-  Schema.Struct({
+    submittedBy: Schema.optionalKey(Schema.String),
+  });
+export const ControlGetOperationSchema = Schema.Struct({ version: Version, operation: Schema.Literal("get"), jobId: JobIdSchema });
+export const ControlTranscriptOperationSchema = Schema.Struct({
     version: Version,
     operation: Schema.Literal("transcript"),
     jobId: JobIdSchema,
-    cursor: Schema.optional(Schema.String),
-  }),
-  Schema.Struct({
+    cursor: Schema.optionalKey(Schema.String),
+  });
+export const ControlListOperationSchema = Schema.Struct({
     version: Version,
     operation: Schema.Literal("list"),
-    status: Schema.optional(JobStatusValueSchema),
+    status: Schema.optionalKey(JobStatusValueSchema),
     limit: Schema.Int.check(Schema.isGreaterThan(0)),
-    cursor: Schema.optional(Schema.String),
-  }),
-  Schema.Struct({ version: Version, operation: Schema.Literal("cancel"), jobId: JobIdSchema }),
+    cursor: Schema.optionalKey(Schema.String),
+  });
+export const ControlCancelOperationSchema = Schema.Struct({ version: Version, operation: Schema.Literal("cancel"), jobId: JobIdSchema });
+
+export const ControlOperationSchema = Schema.Union([
+  ControlRunOperationSchema,
+  ControlGetOperationSchema,
+  ControlTranscriptOperationSchema,
+  ControlListOperationSchema,
+  ControlCancelOperationSchema,
 ]);
 
 export const ResponseOutcomeSchema = Schema.Struct({
@@ -141,21 +147,23 @@ export const JobManifestSchema = Schema.Struct({
   audit: Schema.Struct({ submittedAt: Timestamp, submittedBy: Schema.String }),
   runtime: Schema.Struct({
     writerGeneration: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-    microvmId: Schema.optional(Schema.String),
+    microvmId: Schema.optionalKey(Schema.String),
   }),
   transcript: Schema.Struct({ highestCursor: Schema.NullOr(Schema.String) }),
-  outcome: Schema.optional(OutcomeSchema),
-  failure: Schema.optional(Schema.Struct({ code: Schema.String, message: Schema.String })),
+  outcome: Schema.optionalKey(OutcomeSchema),
+  failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String })),
   artifacts: Schema.Struct({
-    transcript: Schema.optional(Schema.String),
-    piSession: Schema.optional(Schema.String),
+    transcript: Schema.optionalKey(Schema.String),
+    piSession: Schema.optionalKey(Schema.String),
   }),
 });
 
 export const JobListPageSchema = Schema.Struct({
   jobs: Schema.Array(JobManifestSchema),
-  nextCursor: Schema.optional(Schema.String),
+  nextCursor: Schema.optionalKey(Schema.String),
 });
+
+export interface JobListPage extends Schema.Schema.Type<typeof JobListPageSchema> {}
 
 export const ExecutionTranscriptCursorSchema = Schema.Struct({
   version: Version,
@@ -206,25 +214,25 @@ export const CliEventSchema = Schema.Union([
     event: Schema.Literal("job-status"),
     jobId: JobIdSchema,
     status: JobStatusValueSchema,
-    timestamp: Schema.optional(Timestamp),
-    cursor: Schema.optional(Schema.String),
-    outcome: Schema.optional(OutcomeSchema),
-    failure: Schema.optional(Schema.Struct({ code: Schema.String, message: Schema.String })),
-    manifest: Schema.optional(JobManifestSchema),
+    timestamp: Schema.optionalKey(Timestamp),
+    cursor: Schema.optionalKey(Schema.String),
+    outcome: Schema.optionalKey(OutcomeSchema),
+    failure: Schema.optionalKey(Schema.Struct({ code: Schema.String, message: Schema.String })),
+    manifest: Schema.optionalKey(JobManifestSchema),
   }),
   Schema.Struct({
     version: Version,
     event: Schema.Literal("outcome"),
     jobId: JobIdSchema,
     outcome: OutcomeSchema,
-    timestamp: Schema.optional(Timestamp),
-    cursor: Schema.optional(Schema.String),
+    timestamp: Schema.optionalKey(Timestamp),
+    cursor: Schema.optionalKey(Schema.String),
   }),
   Schema.Struct({
     version: Version,
     event: Schema.Literal("job-list"),
     jobs: Schema.Array(JobManifestSchema),
-    nextCursor: Schema.optional(Schema.String),
+    nextCursor: Schema.optionalKey(Schema.String),
   }),
   Schema.Struct({
     version: Version,
@@ -240,7 +248,7 @@ export const CliEventSchema = Schema.Union([
   }),
 ]);
 
-export type JobManifest = typeof JobManifestSchema.Type;
+export interface JobManifest extends Schema.Schema.Type<typeof JobManifestSchema> {}
 export type ExecutionTranscriptEvent = typeof ExecutionTranscriptEventSchema.Type;
 export type PiCompletion = typeof PiCompletionSchema.Type;
 export type ControlOperation = typeof ControlOperationSchema.Type;
@@ -252,4 +260,5 @@ export type ControlTranscriptOperation = Extract<
 >;
 export type ControlListOperation = Extract<ControlOperation, { readonly operation: "list" }>;
 export type ControlCancelOperation = Extract<ControlOperation, { readonly operation: "cancel" }>;
-export type RepositorySetMember = typeof RepositorySetMemberSchema.Type;
+export interface RepositorySetMember extends Schema.Schema.Type<typeof RepositorySetMemberSchema> {}
+export type CliEvent = typeof CliEventSchema.Type;

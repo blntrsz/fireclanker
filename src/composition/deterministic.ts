@@ -68,26 +68,26 @@ const readManifest = (jobId: string) =>
 const readTranscript = (jobId: string) =>
   readPersistedDocument(jobId, transcriptPath(jobId), decodeTranscript);
 
-const DeterministicPi = Layer.effect(
+const DeterministicPi = Layer.succeed(
   Pi,
-  Effect.succeed({
-    complete: (instruction: string) =>
+  Pi.of({
+    complete: Effect.fn("Pi.Deterministic.complete")((instruction: string) =>
       Effect.succeed({
         version: 1 as const,
         kind: "response" as const,
         response: `Deterministic response to: ${instruction}`,
-      }),
+      })),
   }),
 );
 
-const DeterministicTime = Layer.effect(
+const DeterministicTime = Layer.sync(
   Time,
-  Effect.sync(() => {
+  () => {
     let index = 0;
-    return {
-      now: Effect.sync(() => timestamps[index++] ?? timestamps.at(-1)!),
-    };
-  }),
+    return Time.of({
+      now: Effect.sync(() => timestamps[index++] ?? "2000-01-01T00:00:03.000Z"),
+    });
+  },
 );
 
 const JobControlFromDeterministicServices = Layer.effect(
@@ -95,9 +95,8 @@ const JobControlFromDeterministicServices = Layer.effect(
   Effect.gen(function* () {
     const pi = yield* Pi;
     const time = yield* Time;
-    return {
-      submit: (operation) =>
-        Effect.gen(function* () {
+    return JobControl.of({
+      submit: Effect.fn("JobControl.Deterministic.submit")(function* (operation) {
           const { instruction } = operation;
           const jobId = operation.jobId;
           const completion = yield* pi.complete(instruction);
@@ -205,10 +204,14 @@ const JobControlFromDeterministicServices = Layer.effect(
           yield* Effect.promise(() => mkdir(stateDirectory(), { recursive: true }));
           if (process.env.FIRECLANKER_TEST_EXECUTION_DISABLED === "1") {
             const { outcome: _outcome, ...accepted } = manifest;
+            const initialTransition = manifest.transitions[0];
+            if (initialTransition === undefined) {
+              return yield* Effect.die(new Error("Expected the queued Job transition"));
+            }
             const queuedManifest: JobManifest = {
               ...accepted,
               status: "queued",
-              transitions: [manifest.transitions[0]!],
+              transitions: [initialTransition],
               transcript: { highestCursor: null },
             };
             yield* Effect.promise(() =>
@@ -221,44 +224,36 @@ const JobControlFromDeterministicServices = Layer.effect(
           yield* Effect.promise(() => Bun.write(transcriptPath(jobId), JSON.stringify(transcript)));
           return manifest;
         }),
-      get: (operation) => readManifest(operation.jobId),
-      list: (operation) =>
-        Effect.tryPromise({
-          try: async () => {
-            await mkdir(stateDirectory(), { recursive: true });
-            const files = (await readdir(stateDirectory())).filter(
+      get: Effect.fn("JobControl.Deterministic.get")((operation) => readManifest(operation.jobId)),
+      list: Effect.fn("JobControl.Deterministic.list")(function* (operation) {
+            yield* Effect.tryPromise({
+              try: () => mkdir(stateDirectory(), { recursive: true }),
+              catch: () => new InvalidCursor({ message: "Unable to list retained Jobs" }),
+            });
+            const files = (yield* Effect.tryPromise({
+              try: () => readdir(stateDirectory()),
+              catch: () => new InvalidCursor({ message: "Unable to list retained Jobs" }),
+            })).filter(
               (file) => /^job-[a-f0-9]{12}\.json$/.test(file),
             );
-            const retained = (
-              await Promise.all(files.map((file) => Bun.file(join(stateDirectory(), file)).json()))
-            )
-              .map((input) => decodeManifest(input));
-            return paginateJobManifests(retained, operation);
-          },
-          catch: (error) =>
-            error instanceof InvalidCursor
-              ? error
-              : new InvalidCursor({ message: "Unable to list retained Jobs" }),
-        }),
-      cancel: (operation) =>
-        Effect.tryPromise({
-          try: async () => {
+            const inputs = yield* Effect.tryPromise({
+              try: () => Promise.all(files.map((file) => Bun.file(join(stateDirectory(), file)).json())),
+              catch: () => new InvalidCursor({ message: "Unable to list retained Jobs" }),
+            });
+            return yield* paginateJobManifests(inputs.map((input) => decodeManifest(input)), operation);
+      }),
+      cancel: Effect.fn("JobControl.Deterministic.cancel")(function* (operation) {
             const file = Bun.file(manifestPath(operation.jobId));
-            if (!(await file.exists())) throw new JobNotFound({ jobId: operation.jobId });
-            const manifest = decodeManifest(await file.json());
-            const cancelled = cancelJobManifest(manifest, new Date().toISOString());
-            await Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled));
+            if (!(yield* Effect.promise(() => file.exists()))) {
+              return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
+            }
+            const manifest = decodeManifest(yield* Effect.promise(() => file.json()));
+            const cancelled = yield* cancelJobManifest(manifest, new Date().toISOString());
+            yield* Effect.promise(() => Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled)));
             return cancelled;
-          },
-          catch: (error) =>
-            error instanceof JobNotFound
-              ? error
-              : error instanceof JobNotCancellable
-                ? error
-              : new JobNotFound({ jobId: operation.jobId }),
-        }),
-      watch: (operation) => readTranscript(operation.jobId),
-    };
+      }),
+      watch: Effect.fn("JobControl.Deterministic.watch")((operation) => readTranscript(operation.jobId)),
+    });
   }),
 );
 
