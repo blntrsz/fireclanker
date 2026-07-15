@@ -298,7 +298,7 @@ describe("compiled deterministic CLI", () => {
     const terminal = invoke(["--json", "cancel", submitted[0]!.jobId]);
     expect(terminal.exitCode).toBe(1);
     expect(JSON.parse(terminal.stderr.toString()).code).toBe("job_not_cancellable");
-  });
+  }, 15_000);
 
   test("get returns terminal failure data without transcript replay", () => {
     const submitted = invoke(

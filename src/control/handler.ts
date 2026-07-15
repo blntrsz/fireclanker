@@ -1,13 +1,15 @@
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import { Schema } from "effect";
 import {
-  IdempotencyConflict,
-  InvalidCursor,
-  JobNotCancellableError,
-  JobNotFoundError,
   StaleManifest,
   makeJobController,
 } from "../application/job-controller.js";
+import {
+  InvalidCursor,
+  JobIdempotencyConflict,
+  JobNotCancellable,
+  JobNotFound,
+} from "../application/services.js";
 import { S3ManifestStore } from "../infrastructure/s3-manifest-store.js";
 import { ControlOperationSchema } from "../domain/schemas.js";
 
@@ -24,10 +26,10 @@ const store = new S3ManifestStore(bucket, awsConfiguration);
 const lambda = new LambdaClient(awsConfiguration);
 
 const errorCode = (error: unknown) => {
-  if (error instanceof IdempotencyConflict) return error.code;
-  if (error instanceof InvalidCursor) return error.code;
-  if (error instanceof JobNotFoundError) return error.code;
-  if (error instanceof JobNotCancellableError) return error.code;
+  if (error instanceof JobIdempotencyConflict) return "idempotency_conflict";
+  if (error instanceof InvalidCursor) return "invalid_cursor";
+  if (error instanceof JobNotFound) return "job_not_found";
+  if (error instanceof JobNotCancellable) return "job_not_cancellable";
   if (error instanceof StaleManifest) return error.code;
   return "control_operation_failed";
 };

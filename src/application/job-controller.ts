@@ -6,6 +6,14 @@ import type {
   ControlRunOperation,
   JobManifest,
 } from "../domain/schemas.js";
+import {
+  InvalidCursor,
+  JobIdempotencyConflict,
+  JobNotCancellable,
+  JobNotFound,
+} from "./services.js";
+
+export { JobIdempotencyConflict as IdempotencyConflict } from "./services.js";
 
 export type RunOperation = ControlRunOperation;
 export type CancelOperation = ControlCancelOperation;
@@ -52,48 +60,12 @@ export interface ManifestStore {
   readonly list: () => Promise<ReadonlyArray<StoredManifest>>;
 }
 
-export class IdempotencyConflict extends Error {
-  readonly code = "idempotency_conflict";
-
-  constructor(readonly jobId: string) {
-    super(`Job ${jobId} already exists with different submission content`);
-    this.name = "IdempotencyConflict";
-  }
-}
-
 export class StaleManifest extends Error {
   readonly code = "stale_manifest";
 
   constructor(readonly jobId: string) {
     super(`Job ${jobId} was changed concurrently`);
     this.name = "StaleManifest";
-  }
-}
-
-export class InvalidCursor extends Error {
-  readonly code = "invalid_cursor";
-
-  constructor() {
-    super("Invalid Job list cursor");
-    this.name = "InvalidCursor";
-  }
-}
-
-export class JobNotFoundError extends Error {
-  readonly code = "job_not_found";
-
-  constructor(readonly jobId: string) {
-    super(`Job ${jobId} not found`);
-    this.name = "JobNotFoundError";
-  }
-}
-
-export class JobNotCancellableError extends Error {
-  readonly code = "job_not_cancellable";
-
-  constructor(readonly jobId: string) {
-    super(`Job ${jobId} is not cancellable`);
-    this.name = "JobNotCancellableError";
   }
 }
 
@@ -177,7 +149,7 @@ const decodeCursor = (cursor: string, status: JobStatus | undefined) => {
     }
     return decoded.offset as number;
   } catch {
-    throw new InvalidCursor();
+    throw new InvalidCursor({ message: "Invalid Job list cursor" });
   }
 };
 
@@ -206,7 +178,7 @@ export const paginateJobManifests = (
 export const cancelJobManifest = (manifest: JobManifest, timestamp: string): JobManifest => {
   if (manifest.status === "cancelled") return manifest;
   if (manifest.status !== "queued" && manifest.status !== "running") {
-    throw new JobNotCancellableError(manifest.jobId);
+    throw new JobNotCancellable({ jobId: manifest.jobId });
   }
   return {
     ...manifest,
@@ -227,13 +199,13 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
 
     if (operation.operation === "get") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
+      if (existing === undefined) throw new JobNotFound({ jobId: operation.jobId });
       return existing.manifest;
     }
 
     if (operation.operation === "settle") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
+      if (existing === undefined) throw new JobNotFound({ jobId: operation.jobId });
       if (["succeeded", "failed", "cancelled"].includes(existing.manifest.status)) {
         throw new StaleManifest(operation.jobId);
       }
@@ -259,7 +231,7 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
 
     if (operation.operation === "cancel") {
       const existing = await dependencies.store.read(operation.jobId);
-      if (existing === undefined) throw new JobNotFoundError(operation.jobId);
+      if (existing === undefined) throw new JobNotFound({ jobId: operation.jobId });
       const cancelled = cancelJobManifest(existing.manifest, dependencies.now());
       if (cancelled === existing.manifest) return existing.manifest;
       const replaced = await dependencies.store.replace(
@@ -303,7 +275,10 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
     if (existing?.manifest.submission.canonicalHash === canonicalHash) {
       return existing.manifest;
     }
-    throw new IdempotencyConflict(operation.jobId);
+    throw new JobIdempotencyConflict({
+      jobId: operation.jobId,
+      message: `Job ${operation.jobId} already exists with different submission content`,
+    });
   };
   return { handle } as JobController;
 };

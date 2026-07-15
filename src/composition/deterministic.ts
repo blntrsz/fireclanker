@@ -2,8 +2,6 @@ import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
 import {
-  InvalidCursor as ManifestInvalidCursor,
-  JobNotCancellableError,
   cancelJobManifest,
   paginateJobManifests,
 } from "../application/job-controller.js";
@@ -238,8 +236,8 @@ const JobControlFromDeterministicServices = Layer.effect(
             return paginateJobManifests(retained, operation);
           },
           catch: (error) =>
-            error instanceof ManifestInvalidCursor
-              ? new InvalidCursor({ message: error.message })
+            error instanceof InvalidCursor
+              ? error
               : new InvalidCursor({ message: "Unable to list retained Jobs" }),
         }),
       cancel: (operation) =>
@@ -255,8 +253,8 @@ const JobControlFromDeterministicServices = Layer.effect(
           catch: (error) =>
             error instanceof JobNotFound
               ? error
-              : error instanceof JobNotCancellableError
-                ? new JobNotCancellable({ jobId: error.jobId })
+              : error instanceof JobNotCancellable
+                ? error
               : new JobNotFound({ jobId: operation.jobId }),
         }),
       watch: (operation) => readTranscript(operation.jobId),
