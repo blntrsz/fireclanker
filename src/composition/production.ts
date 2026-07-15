@@ -94,6 +94,17 @@ export const ProductionJobControl = Layer.effect(
         const configuration = yield* configurationSource.load(configurationPath);
         let envelope: unknown = operation;
         if (operation.operation === "run") {
+          const catalog = new Set(configuration.repositoryCatalog);
+          const uncatalogued = operation.repositorySet.find(
+            (member) => !catalog.has(member.repository),
+          );
+          if (uncatalogued !== undefined) {
+            return yield* Effect.fail(
+              new InvalidConfiguration({
+                message: `Repository ${uncatalogued.repository} is not in the Repository Catalog`,
+              }),
+            );
+          }
           const caller = yield* Effect.tryPromise({
             try: () => new STSClient({ region: configuration.region }).send(new GetCallerIdentityCommand({})),
             catch: unavailableFailure,

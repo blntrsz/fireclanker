@@ -52,6 +52,101 @@ const decodeOperation = <A, I, R>(schema: Schema.Codec<A, I, R>, input: unknown,
     onExcessProperty: "error",
   })(input).pipe(Effect.mapError(() => new InvalidUsage({ message })));
 
+const repositoryFromRemote = (remote: string): string | undefined => {
+  const trimmed = remote.trim().replace(/\.git$/, "");
+  const https = trimmed.match(/^https:\/\/(?:[^@/]+@)?github\.com\/([^/]+)\/([^/]+)$/i);
+  if (https !== null) return `${https[1]}/${https[2]}`.toLowerCase();
+  const ssh = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+)$/i);
+  if (ssh !== null) return `${ssh[1]}/${ssh[2]}`.toLowerCase();
+  return undefined;
+};
+
+const inferredRepositorySet = (): ReadonlyArray<{ readonly repository: string }> => {
+  if (FIRECLANKER_COMPOSITION === "test") return [];
+  const result = Bun.spawnSync(["git", "remote", "get-url", "origin"], {
+    cwd: process.cwd(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) return [];
+  const repository = repositoryFromRemote(result.stdout.toString());
+  return repository === undefined ? [] : [{ repository }];
+};
+
+type ParsedRepositorySetMember = {
+  readonly repository: string;
+  readonly target?:
+    | { readonly kind: "branch"; readonly name: string }
+    | { readonly kind: "pull-request"; readonly number: number; readonly headBranch: string };
+};
+
+const parseRepositorySet = (
+  repos: Option.Option<string>,
+  targets: ReadonlyArray<string>,
+): Effect.Effect<ReadonlyArray<ParsedRepositorySetMember>, InvalidUsage> =>
+  Effect.gen(function* () {
+    const explicit = Option.getOrUndefined(repos);
+    const members: ReadonlyArray<ParsedRepositorySetMember> = explicit === undefined
+      ? inferredRepositorySet()
+      : [
+          ...new Set(
+            explicit
+              .split(",")
+              .map((repository) => repository.trim().toLowerCase())
+              .filter((repository) => repository.length > 0),
+          ),
+        ].map((repository) => ({ repository }));
+    const byRepository = new Map<string, ParsedRepositorySetMember>(
+      members.map((member) => [member.repository, member]),
+    );
+    for (const rawTarget of targets) {
+      const [repositoryInput, kind, value, headBranch] = rawTarget.split(":");
+      const repository = repositoryInput?.toLowerCase();
+      if (repository === undefined || kind === undefined || value === undefined) {
+        return yield* new InvalidUsage({
+          message:
+            "Targets must use owner/repo:branch:name or owner/repo:pull-request:number:head-branch",
+        });
+      }
+      const member = byRepository.get(repository);
+      if (member === undefined) {
+        return yield* new InvalidUsage({
+          message: `Repository Target ${repository} is not in the Repository Set`,
+        });
+      }
+      if ("target" in member) {
+        return yield* new InvalidUsage({
+          message: `Repository ${repository} has more than one Repository Target`,
+        });
+      }
+      if (kind === "branch") {
+        byRepository.set(repository, { repository, target: { kind, name: value } });
+        continue;
+      }
+      if (kind === "pull-request") {
+        const number = Number.parseInt(value, 10);
+        if (
+          !Number.isInteger(number) ||
+          number <= 0 ||
+          headBranch === undefined ||
+          headBranch.length === 0
+        ) {
+          return yield* new InvalidUsage({
+            message:
+              "Targets must use owner/repo:branch:name or owner/repo:pull-request:number:head-branch",
+          });
+        }
+        byRepository.set(repository, { repository, target: { kind, number, headBranch } });
+        continue;
+      }
+      return yield* new InvalidUsage({
+        message:
+          "Targets must use owner/repo:branch:name or owner/repo:pull-request:number:head-branch",
+      });
+    }
+    return [...byRepository.values()];
+  });
+
 const newJobId = () => {
   const submittedSecond = Math.floor(Date.now() / 1_000)
     .toString(16)
@@ -65,8 +160,10 @@ const run = Command.make(
   {
     instruction: Argument.string("instruction").pipe(Argument.optional),
     file: Flag.string("file").pipe(Flag.optional),
+    repos: Flag.string("repos").pipe(Flag.optional),
+    target: Flag.string("target").pipe(Flag.atLeast(0)),
   },
-  ({ file, instruction }) =>
+  ({ file, instruction, repos, target }) =>
     Effect.gen(function* () {
       const globals = yield* rootCommand;
       const positionalInstruction = Option.getOrUndefined(instruction);
@@ -97,7 +194,7 @@ const run = Command.make(
           operation: "run",
           jobId: newJobId(),
           instruction: resolvedInstruction,
-          repositorySet: [],
+          repositorySet: yield* parseRepositorySet(repos, target),
         },
         "Invalid run operation",
       );
