@@ -1,6 +1,8 @@
 import { Context, Data, Effect } from "effect";
 import type {
   ControlGetOperation,
+  ControlListOperation,
+  ControlCancelOperation,
   ControlRunOperation,
   ControlTranscriptOperation,
   ExecutionTranscriptEvent,
@@ -19,6 +21,19 @@ export class DeploymentUnavailable extends Data.TaggedError("DeploymentUnavailab
 
 export class JobNotFound extends Data.TaggedError("JobNotFound")<{
   readonly jobId: string;
+}> {}
+
+export class JobNotCancellable extends Data.TaggedError("JobNotCancellable")<{
+  readonly jobId: string;
+}> {}
+
+export class JobIdempotencyConflict extends Data.TaggedError("JobIdempotencyConflict")<{
+  readonly jobId: string;
+  readonly message: string;
+}> {}
+
+export class InvalidCursor extends Data.TaggedError("InvalidCursor")<{
+  readonly message: string;
 }> {}
 
 export class InvalidUsage extends Data.TaggedError("InvalidUsage")<{
@@ -46,16 +61,38 @@ export class DeploymentOperationFailure extends Data.TaggedError("DeploymentOper
   readonly message: string;
 }> {}
 
+type JobControlError =
+  | DeploymentUnavailable
+  | InvalidConfiguration
+  | JobIdempotencyConflict
+  | JobNotFound
+  | JobNotCancellable
+  | InvalidCursor;
+
 export interface JobControlService {
   readonly submit: (
     operation: ControlRunOperation,
-  ) => Effect.Effect<JobManifest, DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
   readonly get: (
     operation: ControlGetOperation,
-  ) => Effect.Effect<JobManifest, JobNotFound | DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
+  readonly list: (
+    operation: ControlListOperation,
+    configurationPath?: string,
+  ) => Effect.Effect<
+    { readonly jobs: ReadonlyArray<JobManifest>; readonly nextCursor?: string | undefined },
+    JobControlError
+  >;
+  readonly cancel: (
+    operation: ControlCancelOperation,
+    configurationPath?: string,
+  ) => Effect.Effect<JobManifest, JobControlError>;
   readonly watch: (
     operation: ControlTranscriptOperation,
-  ) => Effect.Effect<ReadonlyArray<ExecutionTranscriptEvent>, JobNotFound | DeploymentUnavailable>;
+    configurationPath?: string,
+  ) => Effect.Effect<ReadonlyArray<ExecutionTranscriptEvent>, JobControlError>;
 }
 
 export class JobControl extends Context.Service<JobControl, JobControlService>()(

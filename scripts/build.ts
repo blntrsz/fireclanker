@@ -7,6 +7,17 @@ if (composition !== "production" && composition !== "test") {
 }
 
 const root = resolve(import.meta.dir, "..");
+const controlHandlerBuild = await Bun.build({
+  entrypoints: [resolve(root, "src", "control", "handler.ts")],
+  target: "node",
+  format: "esm",
+  minify: true,
+});
+if (!controlHandlerBuild.success || controlHandlerBuild.outputs[0] === undefined) {
+  for (const log of controlHandlerBuild.logs) console.error(log);
+  throw new Error("Unable to build the embedded Control Lambda handler");
+}
+const controlHandler = await controlHandlerBuild.outputs[0].text();
 const alchemySource = resolve(root, ".agents", "alchemy-effect", "packages", "alchemy", "src");
 const expectedAlchemyRevision = "c999680eedb38aa1e311c65d8dd9ef67c785b9b8";
 const alchemyCheckout = resolve(alchemySource, "..", "..", "..");
@@ -54,6 +65,7 @@ const result = await Bun.build({
   minify: composition === "production",
   define: {
     FIRECLANKER_COMPOSITION: JSON.stringify(composition),
+    FIRECLANKER_CONTROL_HANDLER: JSON.stringify(controlHandler),
   },
   plugins: [
     {

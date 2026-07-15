@@ -1,11 +1,13 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Layer, Schema } from "effect";
 import {
   DeploymentCore,
   DeploymentOperationFailure,
   JobControl,
+  JobNotCancellable,
   JobNotFound,
+  InvalidCursor,
   Pi,
   Time,
 } from "../application/services.js";
@@ -93,10 +95,7 @@ const JobControlFromDeterministicServices = Layer.effect(
       submit: (operation) =>
         Effect.gen(function* () {
           const { instruction } = operation;
-          const jobId = `job-${new Bun.CryptoHasher("sha256")
-            .update(instruction)
-            .digest("hex")
-            .slice(0, 12)}`;
+          const jobId = operation.jobId;
           const completion = yield* pi.complete(instruction);
           if (completion.kind !== "response") {
             return yield* Effect.die(
@@ -136,16 +135,27 @@ const JobControlFromDeterministicServices = Layer.effect(
           const manifest: JobManifest = {
             version: 1,
             jobId,
-            instruction,
-            repositorySet: [],
+            submission: {
+              canonicalHash: new Bun.CryptoHasher("sha256")
+                .update(JSON.stringify({ instruction, repositorySet: operation.repositorySet }))
+                .digest("hex"),
+              instruction,
+              repositorySet: operation.repositorySet,
+            },
             status: "succeeded",
             transitions: [
               { status: queued.status, timestamp: queued.timestamp },
               { status: running.status, timestamp: running.timestamp },
               { status: succeeded.status, timestamp: succeeded.timestamp },
             ],
-            highestTranscriptCursor: "cursor-4",
+            audit: {
+              submittedAt: new Date().toISOString(),
+              submittedBy: operation.submittedBy ?? "arn:aws:iam::123456789012:user/tester",
+            },
+            runtime: { writerGeneration: 0 },
+            transcript: { highestCursor: "cursor-4" },
             outcome,
+            artifacts: {},
           };
           const transcript: ReadonlyArray<ExecutionTranscriptEvent> = [
             {
@@ -189,11 +199,106 @@ const JobControlFromDeterministicServices = Layer.effect(
           Schema.decodeUnknownSync(JobManifestSchema)(manifest);
           Schema.decodeUnknownSync(Schema.Array(ExecutionTranscriptEventSchema))(transcript);
           yield* Effect.promise(() => mkdir(stateDirectory(), { recursive: true }));
+          if (process.env.FIRECLANKER_TEST_EXECUTION_DISABLED === "1") {
+            const { outcome: _outcome, ...accepted } = manifest;
+            const queuedManifest: JobManifest = {
+              ...accepted,
+              status: "queued",
+              transitions: [manifest.transitions[0]!],
+              transcript: { highestCursor: null },
+            };
+            yield* Effect.promise(() =>
+              Bun.write(manifestPath(jobId), JSON.stringify(queuedManifest)),
+            );
+            yield* Effect.promise(() => Bun.write(transcriptPath(jobId), "[]"));
+            return queuedManifest;
+          }
           yield* Effect.promise(() => Bun.write(manifestPath(jobId), JSON.stringify(manifest)));
           yield* Effect.promise(() => Bun.write(transcriptPath(jobId), JSON.stringify(transcript)));
           return manifest;
         }),
       get: (operation) => readManifest(operation.jobId),
+      list: (operation) =>
+        Effect.tryPromise({
+          try: async () => {
+            await mkdir(stateDirectory(), { recursive: true });
+            const files = (await readdir(stateDirectory())).filter(
+              (file) => /^job-[a-f0-9]{12}\.json$/.test(file),
+            );
+            const retained = (
+              await Promise.all(files.map((file) => Bun.file(join(stateDirectory(), file)).json()))
+            )
+              .map((input) => decodeManifest(input))
+              .filter(
+                (manifest) => operation.status === undefined || manifest.status === operation.status,
+              )
+              .sort(
+                (left, right) =>
+                  right.audit.submittedAt.localeCompare(left.audit.submittedAt) ||
+                  right.jobId.localeCompare(left.jobId),
+              );
+            let offset = 0;
+            if (operation.cursor !== undefined) {
+              try {
+                const cursor = JSON.parse(
+                  Buffer.from(operation.cursor.replace(/^cursor-/, ""), "base64url").toString(),
+                ) as { offset: number; status: string | null };
+                if (
+                  !operation.cursor.startsWith("cursor-") ||
+                  !Number.isInteger(cursor.offset) ||
+                  cursor.offset < 0 ||
+                  cursor.status !== (operation.status ?? null)
+                ) {
+                  throw new Error();
+                }
+                offset = cursor.offset;
+              } catch {
+                throw new InvalidCursor({ message: "Invalid Job list cursor" });
+              }
+            }
+            const jobs = retained.slice(offset, offset + operation.limit);
+            const nextOffset = offset + jobs.length;
+            return {
+              jobs,
+              ...(nextOffset < retained.length
+                ? {
+                    nextCursor: `cursor-${Buffer.from(
+                      JSON.stringify({ offset: nextOffset, status: operation.status ?? null }),
+                    ).toString("base64url")}`,
+                  }
+                : {}),
+            };
+          },
+          catch: (error) =>
+            error instanceof InvalidCursor
+              ? error
+              : new InvalidCursor({ message: "Unable to list retained Jobs" }),
+        }),
+      cancel: (operation) =>
+        Effect.tryPromise({
+          try: async () => {
+            const manifest = await Effect.runPromise(readManifest(operation.jobId));
+            if (manifest.status === "cancelled") return manifest;
+            if (manifest.status !== "queued" && manifest.status !== "running") {
+              throw new JobNotCancellable({ jobId: operation.jobId });
+            }
+            const cancelled: JobManifest = {
+              ...manifest,
+              status: "cancelled",
+              transitions: [
+                ...manifest.transitions,
+                { status: "cancelled", timestamp: new Date().toISOString() },
+              ],
+              failure: { code: "cancelled", message: "Job cancelled by user" },
+            };
+            await Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled));
+            return cancelled;
+          },
+          catch: (error) =>
+            error instanceof JobNotFound || error instanceof JobNotCancellable
+              ? error
+              : new JobNotFound({ jobId: operation.jobId }),
+        }),
       watch: (operation) => readTranscript(operation.jobId),
     };
   }),

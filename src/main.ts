@@ -1,4 +1,5 @@
 import { BunRuntime, BunServices } from "@effect/platform-bun";
+import { randomBytes } from "node:crypto";
 import { Console, Effect, Option, Schema } from "effect";
 import { Argument, CliError, CliOutput, Command, Flag } from "effect/unstable/cli";
 import {
@@ -29,6 +30,8 @@ import {
   CliEventSchema,
   ControlOperationSchema,
   type ControlGetOperation,
+  type ControlListOperation,
+  type ControlCancelOperation,
   type ControlRunOperation,
   type ControlTranscriptOperation,
   type ExecutionTranscriptEvent,
@@ -79,12 +82,13 @@ const run = Command.make(
         {
           version: 1,
           operation: "run",
+          jobId: `job-${randomBytes(6).toString("hex")}`,
           instruction: resolvedInstruction,
           repositorySet: [],
         },
         "Invalid run operation",
       )) as ControlRunOperation;
-      const manifest = yield* control.submit(operation);
+      const manifest = yield* control.submit(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
           jsonLine({
@@ -149,7 +153,7 @@ const get = Command.make(
           },
           `Invalid Job ID: ${jobId}`,
         )) as ControlTranscriptOperation;
-        const events = yield* control.watch(operation);
+        const events = yield* control.watch(operation, Option.getOrUndefined(globals.config));
         yield* Console.log(
           events
             .map((event) =>
@@ -168,7 +172,7 @@ const get = Command.make(
         },
         `Invalid Job ID: ${jobId}`,
       )) as ControlGetOperation;
-      const manifest = yield* control.get(operation);
+      const manifest = yield* control.get(operation, Option.getOrUndefined(globals.config));
       if (globals.json) {
         yield* Console.log(
           jsonLine({
@@ -177,6 +181,7 @@ const get = Command.make(
             jobId: manifest.jobId,
             status: manifest.status,
             ...(manifest.outcome === undefined ? {} : { outcome: manifest.outcome }),
+            ...(manifest.failure === undefined ? {} : { failure: manifest.failure }),
           }),
         );
         return;
@@ -188,12 +193,89 @@ const get = Command.make(
           : outcome?.kind === "change-set"
             ? `\nChange Set: ${outcome.summary}`
             : "";
-      yield* Console.log(`Job ${manifest.jobId}\nStatus: ${manifest.status}${renderedOutcome}`);
+      const renderedFailure =
+        manifest.failure === undefined
+          ? ""
+          : `\nFailure: ${manifest.failure.code}: ${manifest.failure.message}`;
+      yield* Console.log(
+        `Job ${manifest.jobId}\nStatus: ${manifest.status}${renderedOutcome}${renderedFailure}`,
+      );
     }),
 );
 
-const list = Command.make("list");
-const cancel = Command.make("cancel");
+const list = Command.make(
+  "list",
+  {
+    status: Flag.choice("status", ["queued", "running", "succeeded", "failed", "cancelled"] as const).pipe(
+      Flag.optional,
+    ),
+    limit: Flag.integer("limit").pipe(Flag.withDefault(20)),
+    cursor: Flag.string("cursor").pipe(Flag.optional),
+  },
+  ({ cursor, limit, status }) =>
+    Effect.gen(function* () {
+      const globals = yield* rootCommand;
+      const control = yield* JobControl;
+      const operation = (yield* decodeControlOperation(
+        {
+          version: 1,
+          operation: "list",
+          limit,
+          ...(Option.isNone(status) ? {} : { status: status.value }),
+          ...(Option.isNone(cursor) ? {} : { cursor: cursor.value }),
+        },
+        "Invalid Job list arguments",
+      )) as ControlListOperation;
+      const page = yield* control.list(operation, Option.getOrUndefined(globals.config));
+      if (globals.json) {
+        yield* Console.log(
+          jsonLine({
+            version: 1,
+            event: "job-list",
+            jobs: page.jobs,
+            ...(page.nextCursor === undefined ? {} : { nextCursor: page.nextCursor }),
+          }),
+        );
+        return;
+      }
+      const rows = page.jobs.map(
+        (job) => `${job.jobId}  ${job.status}  ${job.audit.submittedAt}  ${job.submission.instruction}`,
+      );
+      if (page.nextCursor !== undefined) {
+        rows.push(
+          `Continue with: fireclanker list${operation.status === undefined ? "" : ` --status ${operation.status}`} --limit ${operation.limit} --cursor ${page.nextCursor}`,
+        );
+      }
+      yield* Console.log(rows.join("\n"));
+    }),
+);
+
+const cancel = Command.make(
+  "cancel",
+  { jobId: Argument.string("job-id") },
+  ({ jobId }) =>
+    Effect.gen(function* () {
+      const globals = yield* rootCommand;
+      const control = yield* JobControl;
+      const operation = (yield* decodeControlOperation(
+        { version: 1, operation: "cancel", jobId },
+        `Invalid Job ID: ${jobId}`,
+      )) as ControlCancelOperation;
+      const manifest = yield* control.cancel(operation, Option.getOrUndefined(globals.config));
+      if (globals.json) {
+        yield* Console.log(
+          jsonLine({
+            version: 1,
+            event: "job-cancelled",
+            jobId: manifest.jobId,
+            status: "cancelled",
+          }),
+        );
+        return;
+      }
+      yield* Console.log(`Job ${manifest.jobId} cancelled`);
+    }),
+);
 
 const renderPlan = (plan: DeploymentPlan) =>
   [
@@ -334,6 +416,12 @@ const program = commandProgram.pipe(
       const code =
         tagged._tag === "JobNotFound"
           ? "job_not_found"
+          : tagged._tag === "JobNotCancellable"
+            ? "job_not_cancellable"
+            : tagged._tag === "JobIdempotencyConflict"
+              ? "idempotency_conflict"
+              : tagged._tag === "InvalidCursor"
+                ? "invalid_cursor"
           : tagged._tag === "DeploymentUnavailable"
             ? "deployment_unavailable"
             : tagged._tag === "InvalidUsage"
@@ -348,8 +436,10 @@ const program = commandProgram.pipe(
                       ? "deployment_failed"
                       : "command_failed";
       const message =
-        tagged._tag === "JobNotFound" && "jobId" in tagged
-          ? `Job ${String(tagged.jobId)} not found`
+        (tagged._tag === "JobNotFound" || tagged._tag === "JobNotCancellable") && "jobId" in tagged
+          ? tagged._tag === "JobNotFound"
+            ? `Job ${String(tagged.jobId)} not found`
+            : `Job ${String(tagged.jobId)} is not cancellable`
           : tagged.message || "Command failed";
       process.stderr.write(
         jsonRequested

@@ -5,12 +5,18 @@ import {
 } from "@aws-sdk/client-secrets-manager";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import { defaultProvider } from "@aws-sdk/credential-provider-node";
-import { Effect, Layer } from "effect";
+import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
+import { Effect, Layer, Schema } from "effect";
 import {
+  ConfigurationSource,
   DeploymentCore,
   DeploymentOperationFailure,
   DeploymentUnavailable,
+  InvalidCursor,
+  JobIdempotencyConflict,
   JobControl,
+  JobNotCancellable,
+  JobNotFound,
 } from "../application/services.js";
 import {
   ALCHEMY_SOURCE_REVISION,
@@ -29,6 +35,11 @@ import {
   planAlchemyStack,
   verifyAlchemyControlAlias,
 } from "../infrastructure/alchemy-core.js";
+import {
+  JobListPageSchema,
+  JobManifestSchema,
+  type ControlOperation,
+} from "../domain/schemas.js";
 
 const unavailable = () =>
   Effect.fail(
@@ -37,12 +48,105 @@ const unavailable = () =>
     }),
   );
 
+class ControlResponseError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly jobId?: string,
+  ) {
+    super(message);
+  }
+}
+
+const controlResponseFailure = (error: unknown) => {
+  if (error instanceof ControlResponseError) {
+    if (error.code === "job_not_found") return new JobNotFound({ jobId: error.jobId ?? "unknown" });
+    if (error.code === "job_not_cancellable") {
+      return new JobNotCancellable({ jobId: error.jobId ?? "unknown" });
+    }
+    if (error.code === "idempotency_conflict") {
+      return new JobIdempotencyConflict({ jobId: error.jobId ?? "unknown", message: error.message });
+    }
+    if (error.code === "invalid_cursor") return new InvalidCursor({ message: error.message });
+  }
+  return new DeploymentUnavailable({
+    message: error instanceof Error ? error.message : "Control Lambda invocation failed",
+  });
+};
+
 export const ProductionJobControl = Layer.effect(
   JobControl,
-  Effect.succeed({
-    submit: unavailable,
-    get: unavailable,
-    watch: unavailable,
+  Effect.gen(function* () {
+    const configurationSource = yield* ConfigurationSource;
+    const invoke = (operation: ControlOperation, configurationPath: string | undefined) =>
+      Effect.gen(function* () {
+        const configuration = yield* configurationSource.load(configurationPath);
+        return yield* Effect.tryPromise({
+          try: async () => {
+            let envelope: unknown = operation;
+            if (operation.operation === "run") {
+              const caller = await new STSClient({ region: configuration.region }).send(
+                new GetCallerIdentityCommand({}),
+              );
+              envelope = { ...operation, ...(caller.Arn === undefined ? {} : { submittedBy: caller.Arn }) };
+            }
+            const response = await new LambdaClient({ region: configuration.region }).send(
+              new InvokeCommand({
+                FunctionName: `fireclanker-${configuration.name}-control`,
+                Qualifier: "live",
+                InvocationType: "RequestResponse",
+                Payload: Buffer.from(JSON.stringify(envelope)),
+              }),
+            );
+            if (response.FunctionError !== undefined || response.Payload === undefined) {
+              throw new Error(response.FunctionError ?? "Control Lambda returned no payload");
+            }
+            const decoded = JSON.parse(Buffer.from(response.Payload).toString()) as {
+              version?: number;
+              ok?: boolean;
+              value?: unknown;
+              error?: { code?: string; message?: string };
+            };
+            if (decoded.version !== 1 || decoded.ok !== true) {
+              throw new ControlResponseError(
+                decoded.error?.code ?? "control_operation_failed",
+                decoded.error?.message ?? "Control Lambda rejected the operation",
+                "jobId" in operation ? operation.jobId : undefined,
+              );
+            }
+            return decoded.value;
+          },
+          catch: controlResponseFailure,
+        });
+      });
+
+    return {
+      submit: (operation, configurationPath) =>
+        invoke(operation, configurationPath).pipe(
+          Effect.map((value) =>
+            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
+          ),
+        ),
+      get: (operation, configurationPath) =>
+        invoke(operation, configurationPath).pipe(
+          Effect.map((value) =>
+            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
+          ),
+        ),
+      list: (operation, configurationPath) =>
+        invoke(operation, configurationPath).pipe(
+          Effect.map((value) =>
+            Schema.decodeUnknownSync(JobListPageSchema, { onExcessProperty: "error" })(value),
+          ),
+        ),
+      cancel: (operation, configurationPath) =>
+        invoke(operation, configurationPath).pipe(
+          Effect.map((value) =>
+            Schema.decodeUnknownSync(JobManifestSchema, { onExcessProperty: "error" })(value),
+          ),
+        ),
+      watch: unavailable,
+    };
   }),
 );
 
@@ -267,7 +371,7 @@ export const ProductionDeploymentCore = Layer.effect(
   }),
 );
 import { GetRolePolicyCommand, IAMClient, NoSuchEntityException } from "@aws-sdk/client-iam";
-import { GetAliasCommand, GetFunctionCommand, LambdaClient, ResourceNotFoundException as LambdaNotFound } from "@aws-sdk/client-lambda";
+import { GetAliasCommand, GetFunctionCommand, ResourceNotFoundException as LambdaNotFound } from "@aws-sdk/client-lambda";
 import {
   GetObjectCommand,
   HeadBucketCommand,

@@ -28,12 +28,9 @@ export interface AmbientCredentials {
   readonly sessionToken?: string;
 }
 
-const controlHandler = `
-export const handler = async (event: unknown) => ({
-  statusCode: 200,
-  body: JSON.stringify({ version: 1, accepted: true, event })
-});
-`;
+declare const FIRECLANKER_CONTROL_HANDLER: string;
+
+const controlHandler = FIRECLANKER_CONTROL_HANDLER;
 
 const runtimeDockerfile = `FROM public.ecr.aws/lambda/microvms:al2023-minimal
 RUN dnf install -y python3 && dnf clean all
@@ -196,6 +193,7 @@ const createStack = (
         runtime: "nodejs22.x",
         url: false,
         env: {
+          FIRECLANKER_DATA_BUCKET: dataBucket,
           FIRECLANKER_CONFIGURATION_BUCKET: dataBucket,
           FIRECLANKER_CONFIGURATION_KEY: "runtime-configuration.json",
         },
