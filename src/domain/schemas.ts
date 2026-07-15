@@ -89,6 +89,7 @@ const PullRequestSchema = Schema.Struct({
   title: Schema.String,
   url: Schema.String,
   draft: Schema.Boolean,
+  headBranch: Schema.String,
 });
 
 export const ChangeSetOutcomeSchema = Schema.Struct({
@@ -98,7 +99,22 @@ export const ChangeSetOutcomeSchema = Schema.Struct({
   pullRequests: Schema.Array(PullRequestSchema),
 });
 
-export const OutcomeSchema = Schema.Union([ResponseOutcomeSchema, ChangeSetOutcomeSchema]);
+export const PublicationFailureOutcomeSchema = Schema.Struct({
+  version: Version,
+  kind: Schema.Literal("publication-failure"),
+  code: Schema.String,
+  message: Schema.String,
+  retainedBranches: Schema.Array(Schema.Struct({ repository: RepositoryName, branch: Schema.String })),
+  retainedPullRequests: Schema.Array(PullRequestSchema),
+  failedRepository: RepositoryName,
+  unattemptedRepositories: Schema.Array(RepositoryName),
+});
+
+export const OutcomeSchema = Schema.Union([
+  ResponseOutcomeSchema,
+  ChangeSetOutcomeSchema,
+  PublicationFailureOutcomeSchema,
+]);
 
 export const PublicationPlanSchema = Schema.Struct({
   version: Version,
@@ -111,14 +127,7 @@ export const PublicationPlanSchema = Schema.Struct({
   ),
 });
 
-export const PublicationFailureSchema = Schema.Struct({
-  version: Version,
-  kind: Schema.Literal("publication-failure"),
-  code: Schema.String,
-  completed: Schema.Array(PullRequestSchema),
-  failedRepository: RepositoryName,
-  unattemptedRepositories: Schema.Array(RepositoryName),
-});
+export const PublicationFailureSchema = PublicationFailureOutcomeSchema;
 
 export const PiCompletionSchema = Schema.Union([
   Schema.Struct({ version: Version, kind: Schema.Literal("response"), response: Schema.String }),

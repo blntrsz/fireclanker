@@ -238,9 +238,13 @@ const renderTranscriptEvent = (event: ExecutionTranscriptEvent): string => {
   if (event.type === "status") {
     return `[${event.timestamp}] Job ${event.jobId} ${event.status}`;
   }
-  return event.outcome.kind === "response"
-    ? `[${event.timestamp}] Response: ${event.outcome.response}`
-    : `[${event.timestamp}] Change Set: ${event.outcome.summary}`;
+  if (event.outcome.kind === "response") {
+    return `[${event.timestamp}] Response: ${event.outcome.response}`;
+  }
+  if (event.outcome.kind === "change-set") {
+    return `[${event.timestamp}] Change Set: ${event.outcome.summary}`;
+  }
+  return `[${event.timestamp}] Publication Failure: ${event.outcome.code}: ${event.outcome.message}`;
 };
 
 const jsonTranscriptEvent = (event: ExecutionTranscriptEvent): CliEvent =>
