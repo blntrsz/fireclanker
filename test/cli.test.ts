@@ -145,7 +145,6 @@ describe("compiled deterministic CLI", () => {
     );
   });
 
-
   test("run accepts a canonical Repository Set and Repository Targets", () => {
     const submitted = invoke([
       "--json",
@@ -184,6 +183,42 @@ describe("compiled deterministic CLI", () => {
       code: "invalid_usage",
       message: "Repository Target openai/other is not in the Repository Set",
     });
+  });
+
+  test("run --watch streams the transcript immediately after submission", () => {
+    const watched = invoke(["run", "Watch from submission", "--watch"]);
+    const jobId = watched.stdout.toString().match(/job-[a-f0-9]{12}/)?.[0];
+
+    expect(jobId).toBeDefined();
+    expect(watched.exitCode).toBe(0);
+    expect(watched.stderr.toString()).toBe("");
+    expect(watched.stdout.toString()).toBe(
+      [
+        `[2000-01-01T00:00:00.000Z] Job ${jobId} queued`,
+        `[2000-01-01T00:00:01.000Z] Job ${jobId} running`,
+        "[2000-01-01T00:00:02.000Z] Response: Deterministic response to: Watch from submission",
+        `[2000-01-01T00:00:03.000Z] Job ${jobId} succeeded`,
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("get --watch --cursor resumes replay after the opaque cursor", () => {
+    const submitted = invoke(["run", "Resume after cursor"]);
+    const jobId = submitted.stdout.toString().match(/job-[a-f0-9]{12}/)?.[0];
+    expect(jobId).toBeDefined();
+
+    const resumed = invoke(["get", jobId!, "--watch", "--cursor", "cursor-1"]);
+    expect(resumed.exitCode).toBe(0);
+    expect(resumed.stderr.toString()).toBe("");
+    expect(resumed.stdout.toString()).toBe(
+      [
+        `[2000-01-01T00:00:01.000Z] Job ${jobId} running`,
+        "[2000-01-01T00:00:02.000Z] Response: Deterministic response to: Resume after cursor",
+        `[2000-01-01T00:00:03.000Z] Job ${jobId} succeeded`,
+        "",
+      ].join("\n"),
+    );
   });
 
   test("JSON mode emits one compact versioned event per line", () => {
