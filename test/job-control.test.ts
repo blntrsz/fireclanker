@@ -19,6 +19,7 @@ const dependencies = (store = new InMemoryManifestStore(), now = Effect.succeed(
   now,
   submittedBy: Effect.succeed("arn:aws:iam::123456789012:user/tester"),
   wakeLaunch: () => Effect.void,
+  requestTermination: () => Effect.void,
 });
 
 const manifestEffect = (controller: ReturnType<typeof makeJobController>, operation: Parameters<ReturnType<typeof makeJobController>["handle"]>[0]) =>
@@ -115,7 +116,6 @@ describe("Control Job operations", () => {
     expect(first.transitions.filter(({ status }) => status === "cancelled")).toHaveLength(1);
   });
 
-
   test("starting a queued Job conditionally commits running runtime identity", async () => {
     const timestamps = [
       "2000-01-01T00:00:00.000Z",
@@ -165,6 +165,70 @@ describe("Control Job operations", () => {
     expect(afterLaunch.status).toBe("cancelled");
     expect(afterLaunch.runtime).toEqual({ writerGeneration: 0 });
     expect(afterLaunch.transitions.map(({ status }) => status)).toEqual(["queued", "cancelled"]);
+  });
+
+  test("cancelling running commits terminal status before requesting MicroVM termination", async () => {
+    const terminationRequests: string[] = [];
+    const store = new InMemoryManifestStore();
+    const controller = makeJobController({
+      ...dependencies(store),
+      store,
+      requestTermination: (microvmId) => Effect.sync(() => {
+        const stored = store.snapshot(submission.jobId);
+        terminationRequests.push(`${microvmId}:${stored?.manifest.status ?? "missing"}`);
+      }),
+    });
+    await Effect.runPromise(manifestEffect(controller, submission));
+    await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "start",
+      jobId: submission.jobId,
+      microvmId: "fireclanker-runtime-001",
+      writerGeneration: 1,
+    }));
+
+    const cancelled = await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "cancel",
+      jobId: submission.jobId,
+    }));
+
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.transitions.map(({ status }) => status)).toEqual([
+      "queued",
+      "running",
+      "cancelled",
+    ]);
+    expect(terminationRequests).toEqual(["fireclanker-runtime-001:cancelled"]);
+  });
+
+  test("launch confirmation after cancellation requests termination without reopening terminal status", async () => {
+    const terminationRequests: string[] = [];
+    const controller = makeJobController({
+      ...dependencies(),
+      requestTermination: (microvmId) =>
+        Effect.sync(() => {
+          terminationRequests.push(microvmId);
+        }),
+    });
+    await Effect.runPromise(manifestEffect(controller, submission));
+    await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "cancel",
+      jobId: submission.jobId,
+    }));
+
+    const afterLaunch = await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "start",
+      jobId: submission.jobId,
+      microvmId: "fireclanker-runtime-001",
+      writerGeneration: 1,
+    }));
+
+    expect(afterLaunch.status).toBe("cancelled");
+    expect(afterLaunch.transitions.map(({ status }) => status)).toEqual(["queued", "cancelled"]);
+    expect(terminationRequests).toEqual(["fireclanker-runtime-001"]);
   });
 
   test("competing terminal writes use ETags so the first terminal status wins", async () => {

@@ -38,6 +38,31 @@ const failureEnvelope = (error: unknown) => ({
 const launchClientToken = (jobId: string) =>
   `fireclanker-${createHash("sha256").update(jobId).digest("hex").slice(0, 48)}`;
 
+const invokeAsync = (
+  lambda: LambdaClient,
+  functionName: string,
+  payload: unknown,
+  operation: string,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      lambda
+        .send(
+          new InvokeCommand({
+            FunctionName: functionName,
+            Qualifier: "live",
+            InvocationType: "Event",
+            Payload: Buffer.from(JSON.stringify(payload)),
+          }),
+        )
+        .then(() => undefined),
+    catch: (cause) =>
+      new ManifestPersistenceError({
+        operation,
+        message: cause instanceof Error ? cause.message : `${operation} request failed`,
+      }),
+  });
+
 const responseFor = (manifest: JobManifest) => ({
   version: 1 as const,
   kind: "response" as const,
@@ -59,25 +84,29 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
     now: Effect.sync(() => new Date().toISOString()),
     submittedBy: Effect.succeed(submittedBy),
     wakeLaunch: (jobId) =>
-      Effect.tryPromise({
-        try: () =>
-          lambda
-            .send(
-              new InvokeCommand({
-                FunctionName: functionName,
-                Qualifier: "live",
-                InvocationType: "Event",
-                Payload: Buffer.from(JSON.stringify({ version: 1, operation: "launch", jobId })),
-              }),
-            )
-            .then(() => undefined),
-        catch: (cause) =>
-          new ManifestPersistenceError({
-            operation: "wake-launch",
-            message: cause instanceof Error ? cause.message : "Launch wake-up failed",
-          }),
-      }),
+      invokeAsync(lambda, functionName, { version: 1, operation: "launch", jobId }, "wake-launch"),
+    requestTermination: (microvmId) =>
+      invokeAsync(
+        lambda,
+        functionName,
+        { version: 1, operation: "terminate", microvmId },
+        "terminate-microvm",
+      ),
   });
+
+  if (
+    typeof event === "object" &&
+    event !== null &&
+    "version" in event &&
+    event.version === 1 &&
+    "operation" in event &&
+    event.operation === "terminate" &&
+    "microvmId" in event &&
+    typeof event.microvmId === "string" &&
+    Object.keys(event).every((key) => ["version", "operation", "microvmId"].includes(key))
+  ) {
+    return { version: 1 as const, ok: true as const, value: { requested: true } };
+  }
 
   if (
     typeof event === "object" &&
