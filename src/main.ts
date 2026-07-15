@@ -342,10 +342,19 @@ const get = Command.make(
           : outcome?.kind === "change-set"
             ? `\nChange Set: ${outcome.summary}`
             : "";
+      const renderedPublicationFailure = manifest.failure?.publication === undefined
+        ? ""
+        : [
+            `Retained branches: ${manifest.failure.publication.retainedBranches.map(({ repository, branch }) => `${repository}@${branch}`).join(", ") || "(none)"}`,
+            `Retained pull requests: ${manifest.failure.publication.pullRequests.map(({ repository, number }) => `${repository}#${number}`).join(", ") || "(none)"}`,
+            `Failed repository: ${manifest.failure.publication.failedRepository}`,
+            `Unattempted repositories: ${manifest.failure.publication.unattemptedRepositories.join(", ") || "(none)"}`,
+            "Unpublished local changes are not retained after the failed MicroVM is destroyed.",
+          ].join("\n");
       const renderedFailure =
         manifest.failure === undefined
           ? ""
-          : `\nFailure: ${manifest.failure.code}: ${manifest.failure.message}`;
+          : `\nFailure: ${manifest.failure.code}: ${manifest.failure.message}${renderedPublicationFailure === "" ? "" : `\n${renderedPublicationFailure}`}`;
       const repositories = manifest.submission.repositorySet
         .map(({ repository }) => repository)
         .join(", ");

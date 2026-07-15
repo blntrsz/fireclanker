@@ -298,3 +298,44 @@ describe("Control Job operations", () => {
     expect(cancelled.jobs.map((job) => job.jobId)).toEqual(["job-000000000002"]);
   });
 });
+
+describe("Publication Failure settlement", () => {
+  test("terminal failed Job exposes retained publication state", async () => {
+    const controller = makeJobController(dependencies());
+    await Effect.runPromise(manifestEffect(controller, submission));
+
+    const failed = await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "settle",
+      jobId: submission.jobId,
+      status: "failed",
+      failure: {
+        code: "repository_publication_failed",
+        message: "failed at openai/bravo",
+        publication: {
+          version: 1,
+          kind: "publication-failure",
+          code: "repository_publication_failed",
+          message: "failed at openai/bravo",
+          retainedBranches: [{ repository: "openai/alpha", branch: "fireclanker/job", commit: "abc123" }],
+          pullRequests: [{ repository: "openai/alpha", number: 1, title: "Alpha", url: "https://github.com/openai/alpha/pull/1", draft: true }],
+          failedRepository: "openai/bravo",
+          unattemptedRepositories: ["openai/charlie"],
+        },
+      },
+    }));
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      failure: {
+        code: "repository_publication_failed",
+        publication: {
+          retainedBranches: [{ repository: "openai/alpha", branch: "fireclanker/job", commit: "abc123" }],
+          pullRequests: [{ repository: "openai/alpha", number: 1 }],
+          failedRepository: "openai/bravo",
+          unattemptedRepositories: ["openai/charlie"],
+        },
+      },
+    });
+  });
+});
