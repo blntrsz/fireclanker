@@ -145,6 +145,47 @@ describe("compiled deterministic CLI", () => {
     );
   });
 
+
+  test("run accepts a canonical Repository Set and Repository Targets", () => {
+    const submitted = invoke([
+      "--json",
+      "run",
+      "Inspect repositories",
+      "--repos",
+      "OpenAI/Example,openai/example",
+      "--target",
+      "openai/example:branch:main",
+    ]);
+    expect(submitted.exitCode, submitted.stderr.toString()).toBe(0);
+    const jobId = JSON.parse(submitted.stdout.toString()).jobId as string;
+
+    const snapshot = invoke(["--json", "get", jobId]);
+    expect(snapshot.exitCode, snapshot.stderr.toString()).toBe(0);
+    expect(JSON.parse(snapshot.stdout.toString()).manifest.submission.repositorySet).toEqual([
+      { repository: "openai/example", target: { kind: "branch", name: "main" } },
+    ]);
+  });
+
+  test("run rejects Repository Targets outside the Repository Set", () => {
+    const rejected = invoke([
+      "--json",
+      "run",
+      "Inspect target boundaries",
+      "--repos",
+      "openai/example",
+      "--target",
+      "openai/other:pull-request:12:feature",
+    ]);
+
+    expect(rejected.exitCode).toBe(2);
+    expect(JSON.parse(rejected.stderr.toString())).toEqual({
+      version: 1,
+      event: "error",
+      code: "invalid_usage",
+      message: "Repository Target openai/other is not in the Repository Set",
+    });
+  });
+
   test("JSON mode emits one compact versioned event per line", () => {
     const submitted = invoke(["--json", "run", "Explain NDJSON"]);
     expect(submitted.exitCode).toBe(0);
