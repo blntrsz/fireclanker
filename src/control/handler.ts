@@ -1,4 +1,5 @@
 import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
+import { createHash } from "node:crypto";
 import { Config, Effect, Schema } from "effect";
 import { makeJobController } from "../application/job-controller.js";
 import {
@@ -9,7 +10,7 @@ import {
   ManifestPersistenceError,
   StaleManifest,
 } from "../application/services.js";
-import { ControlOperationSchema } from "../domain/schemas.js";
+import { ControlOperationSchema, type JobManifest } from "../domain/schemas.js";
 import { S3ManifestStore } from "../infrastructure/s3-manifest-store.js";
 
 interface LambdaContext {
@@ -34,6 +35,15 @@ const failureEnvelope = (error: unknown) => ({
   },
 });
 
+const launchClientToken = (jobId: string) =>
+  `fireclanker-${createHash("sha256").update(jobId).digest("hex").slice(0, 48)}`;
+
+const responseFor = (manifest: JobManifest) => ({
+  version: 1 as const,
+  kind: "response" as const,
+  response: `Response job ${manifest.jobId} completed for: ${manifest.submission.instruction}`,
+});
+
 const handle = Effect.fn("ControlLambda.handle")(function* (
   event: unknown,
   context: LambdaContext,
@@ -42,43 +52,12 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
   const region = yield* Config.string("AWS_REGION");
   const functionName = yield* Config.string("AWS_LAMBDA_FUNCTION_NAME");
   const awsConfiguration = { region };
-
-  if (
-    typeof event === "object" &&
-    event !== null &&
-    "version" in event &&
-    event.version === 1 &&
-    "operation" in event &&
-    event.operation === "launch" &&
-    "jobId" in event &&
-    typeof event.jobId === "string" &&
-    /^job-[a-f0-9]{12}$/.test(event.jobId) &&
-    Object.keys(event).every((key) => ["version", "operation", "jobId"].includes(key))
-  ) {
-    return { version: 1 as const, ok: true as const, value: { accepted: true } };
-  }
-
-  const operation = yield* Schema.decodeUnknownEffect(ControlOperationSchema, {
-    onExcessProperty: "error",
-  })(event);
-  if (operation.operation === "transcript") {
-    return yield* Effect.fail(
-      new ManifestPersistenceError({
-        operation: "transcript",
-        message: "Execution Transcript reads are unavailable until execution is enabled",
-      }),
-    );
-  }
-
   const lambda = new LambdaClient(awsConfiguration);
-  const controller = makeJobController({
+
+  const controller = (submittedBy = context.invokedFunctionArn) => makeJobController({
     store: new S3ManifestStore(bucket, awsConfiguration),
     now: Effect.sync(() => new Date().toISOString()),
-    submittedBy: Effect.succeed(
-      operation.operation === "run" && operation.submittedBy !== undefined
-        ? operation.submittedBy
-        : context.invokedFunctionArn,
-    ),
+    submittedBy: Effect.succeed(submittedBy),
     wakeLaunch: (jobId) =>
       Effect.tryPromise({
         try: () =>
@@ -99,7 +78,62 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
           }),
       }),
   });
-  const value = yield* controller.handle(operation);
+
+  if (
+    typeof event === "object" &&
+    event !== null &&
+    "version" in event &&
+    event.version === 1 &&
+    "operation" in event &&
+    event.operation === "launch" &&
+    "jobId" in event &&
+    typeof event.jobId === "string" &&
+    /^job-[a-f0-9]{12}$/.test(event.jobId) &&
+    Object.keys(event).every((key) => ["version", "operation", "jobId"].includes(key))
+  ) {
+    const current = yield* controller().handle({ version: 1, operation: "get", jobId: event.jobId });
+    if ("jobs" in current) return yield* Effect.die("Expected Job manifest");
+    if (current.status === "cancelled") {
+      return { version: 1 as const, ok: true as const, value: { accepted: false, status: "cancelled" } };
+    }
+    const running = yield* controller().handle({
+      version: 1,
+      operation: "start",
+      jobId: event.jobId,
+      microvmId: launchClientToken(event.jobId),
+      writerGeneration: current.runtime.writerGeneration + 1,
+    });
+    if ("jobs" in running) return yield* Effect.die("Expected running Job manifest");
+    if (running.status === "cancelled") {
+      return { version: 1 as const, ok: true as const, value: { accepted: false, status: "cancelled" } };
+    }
+    const settled = yield* controller().handle({
+      version: 1,
+      operation: "settle",
+      jobId: event.jobId,
+      status: "succeeded",
+      outcome: responseFor(running),
+    });
+    return { version: 1 as const, ok: true as const, value: settled };
+  }
+
+  const operation = yield* Schema.decodeUnknownEffect(ControlOperationSchema, {
+    onExcessProperty: "error",
+  })(event);
+  if (operation.operation === "transcript") {
+    return yield* Effect.fail(
+      new ManifestPersistenceError({
+        operation: "transcript",
+        message: "Execution Transcript reads are unavailable until execution is enabled",
+      }),
+    );
+  }
+
+  const value = yield* controller(
+    operation.operation === "run" && operation.submittedBy !== undefined
+      ? operation.submittedBy
+      : context.invokedFunctionArn,
+  ).handle(operation);
   return { version: 1 as const, ok: true as const, value };
 });
 

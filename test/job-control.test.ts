@@ -115,6 +115,58 @@ describe("Control Job operations", () => {
     expect(first.transitions.filter(({ status }) => status === "cancelled")).toHaveLength(1);
   });
 
+
+  test("starting a queued Job conditionally commits running runtime identity", async () => {
+    const timestamps = [
+      "2000-01-01T00:00:00.000Z",
+      "2000-01-01T00:00:01.000Z",
+    ];
+    const controller = makeJobController(dependencies(
+      new InMemoryManifestStore(),
+      Effect.sync(() => timestamps.shift() ?? "2000-01-01T00:00:01.000Z"),
+    ));
+    await Effect.runPromise(manifestEffect(controller, submission));
+
+    const running = await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "start",
+      jobId: submission.jobId,
+      microvmId: "fireclanker-runtime-001",
+      writerGeneration: 1,
+    }));
+
+    expect(running).toMatchObject({
+      status: "running",
+      transitions: [
+        { status: "queued", timestamp: "2000-01-01T00:00:00.000Z" },
+        { status: "running", timestamp: "2000-01-01T00:00:01.000Z" },
+      ],
+      runtime: { writerGeneration: 1, microvmId: "fireclanker-runtime-001" },
+    });
+  });
+
+  test("cancellation winning the launch race remains cancelled", async () => {
+    const controller = makeJobController(dependencies());
+    await Effect.runPromise(manifestEffect(controller, submission));
+    await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "cancel",
+      jobId: submission.jobId,
+    }));
+
+    const afterLaunch = await Effect.runPromise(manifestEffect(controller, {
+      version: 1,
+      operation: "start",
+      jobId: submission.jobId,
+      microvmId: "fireclanker-runtime-001",
+      writerGeneration: 1,
+    }));
+
+    expect(afterLaunch.status).toBe("cancelled");
+    expect(afterLaunch.runtime).toEqual({ writerGeneration: 0 });
+    expect(afterLaunch.transitions.map(({ status }) => status)).toEqual(["queued", "cancelled"]);
+  });
+
   test("competing terminal writes use ETags so the first terminal status wins", async () => {
     const controller = makeJobController(dependencies());
     await Effect.runPromise(manifestEffect(controller, submission));

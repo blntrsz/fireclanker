@@ -25,6 +25,14 @@ export type GetOperation = ControlGetOperation;
 export type ListOperation = ControlListOperation;
 export type JobStatus = JobManifest["status"];
 
+export type StartOperation = {
+  readonly version: 1;
+  readonly operation: "start";
+  readonly jobId: string;
+  readonly microvmId: string;
+  readonly writerGeneration: number;
+};
+
 export type SettleOperation =
   | {
       readonly version: 1;
@@ -46,6 +54,7 @@ export type JobOperation =
   | GetOperation
   | ListOperation
   | CancelOperation
+  | StartOperation
   | SettleOperation;
 
 export interface StoredManifest {
@@ -220,6 +229,38 @@ export const makeJobController = (dependencies: JobControllerDependencies): JobC
       const existing = yield* dependencies.store.read(operation.jobId);
       if (existing === undefined) return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
       return existing.manifest;
+    }
+
+    if (operation.operation === "start") {
+      const existing = yield* dependencies.store.read(operation.jobId);
+      if (existing === undefined) return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
+      if (existing.manifest.status === "cancelled") return existing.manifest;
+      if (existing.manifest.status !== "queued") {
+        return yield* Effect.fail(new StaleManifest({ jobId: operation.jobId }));
+      }
+      const running: JobManifest = {
+        ...existing.manifest,
+        status: "running",
+        transitions: [
+          ...existing.manifest.transitions,
+          { status: "running", timestamp: yield* dependencies.now },
+        ],
+        runtime: {
+          writerGeneration: operation.writerGeneration,
+          microvmId: operation.microvmId,
+        },
+      };
+      const replaced = yield* dependencies.store.replace(
+        operation.jobId,
+        existing.etag,
+        running,
+      );
+      if (replaced === undefined) {
+        const winner = yield* dependencies.store.read(operation.jobId);
+        if (winner?.manifest.status === "cancelled") return winner.manifest;
+        return yield* Effect.fail(new StaleManifest({ jobId: operation.jobId }));
+      }
+      return replaced.manifest;
     }
 
     if (operation.operation === "settle") {
