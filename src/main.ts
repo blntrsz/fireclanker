@@ -10,6 +10,7 @@ import {
   GitHubTokenRequired,
   InvalidUsage,
   JobControl,
+  type JobControlService,
   TerminalInteraction,
 } from "./application/services.js";
 import {
@@ -34,6 +35,7 @@ import {
   ControlRunOperationSchema,
   ControlTranscriptOperationSchema,
   type CliEvent,
+  type ControlTranscriptOperation,
   type ExecutionTranscriptEvent,
 } from "./domain/schemas.js";
 
@@ -65,8 +67,10 @@ const run = Command.make(
   {
     instruction: Argument.string("instruction").pipe(Argument.optional),
     file: Flag.string("file").pipe(Flag.optional),
+    watch: Flag.boolean("watch"),
+    cursor: Flag.string("cursor").pipe(Flag.optional),
   },
-  ({ file, instruction }) =>
+  ({ cursor, file, instruction, watch }) =>
     Effect.gen(function* () {
       const globals = yield* rootCommand;
       const positionalInstruction = Option.getOrUndefined(instruction);
@@ -102,6 +106,20 @@ const run = Command.make(
         "Invalid run operation",
       );
       const manifest = yield* control.submit(operation, Option.getOrUndefined(globals.config));
+      if (watch) {
+        const watchOperation = yield* decodeOperation(
+          ControlTranscriptOperationSchema,
+          {
+            version: 1,
+            operation: "transcript",
+            jobId: manifest.jobId,
+            ...(Option.isNone(cursor) ? {} : { cursor: cursor.value }),
+          },
+          `Invalid watch cursor for Job ${manifest.jobId}`,
+        );
+        yield* streamWatch(control, watchOperation, Option.getOrUndefined(globals.config), globals.json);
+        return;
+      }
       if (globals.json) {
         yield* Console.log(
           jsonLine({
@@ -147,13 +165,37 @@ const jsonTranscriptEvent = (event: ExecutionTranscriptEvent): CliEvent =>
         cursor: event.cursor,
       };
 
+
+const streamWatch = (
+  control: JobControlService,
+  operation: ControlTranscriptOperation,
+  configurationPath: string | undefined,
+  json: boolean,
+) =>
+  Effect.gen(function* () {
+    const events = yield* control.watch(operation, configurationPath);
+    yield* Console.log(
+      events
+        .map((event) => (json ? jsonLine(jsonTranscriptEvent(event)) : renderTranscriptEvent(event)))
+        .join("\n"),
+    );
+    const terminal = [...events].reverse().find(
+      (event: ExecutionTranscriptEvent) =>
+        event.type === "status" && ["succeeded", "failed", "cancelled"].includes(event.status),
+    );
+    if (terminal?.type === "status" && terminal.status !== "succeeded") {
+      process.exitCode = 1;
+    }
+  });
+
 const get = Command.make(
   "get",
   {
     jobId: Argument.string("job-id"),
     watch: Flag.boolean("watch"),
+    cursor: Flag.string("cursor").pipe(Flag.optional),
   },
-  ({ jobId, watch }) =>
+  ({ cursor, jobId, watch }) =>
     Effect.gen(function* () {
       const globals = yield* rootCommand;
       const control = yield* JobControl;
@@ -164,17 +206,11 @@ const get = Command.make(
             version: 1,
             operation: "transcript",
             jobId,
+            ...(Option.isNone(cursor) ? {} : { cursor: cursor.value }),
           },
           `Invalid Job ID: ${jobId}`,
         );
-        const events = yield* control.watch(operation, Option.getOrUndefined(globals.config));
-        yield* Console.log(
-          events
-            .map((event) =>
-              globals.json ? jsonLine(jsonTranscriptEvent(event)) : renderTranscriptEvent(event),
-            )
-            .join("\n"),
-        );
+        yield* streamWatch(control, operation, Option.getOrUndefined(globals.config), globals.json);
         return;
       }
 

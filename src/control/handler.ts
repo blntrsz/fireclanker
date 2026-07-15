@@ -10,7 +10,7 @@ import {
   ManifestPersistenceError,
   StaleManifest,
 } from "../application/services.js";
-import { ControlOperationSchema, type JobManifest } from "../domain/schemas.js";
+import { ControlOperationSchema, type ExecutionTranscriptEvent, type JobManifest } from "../domain/schemas.js";
 import { S3ManifestStore } from "../infrastructure/s3-manifest-store.js";
 
 interface LambdaContext {
@@ -37,6 +37,47 @@ const failureEnvelope = (error: unknown) => ({
 
 const launchClientToken = (jobId: string) =>
   `fireclanker-${createHash("sha256").update(jobId).digest("hex").slice(0, 48)}`;
+
+
+const transcriptFor = (manifest: JobManifest): ReadonlyArray<ExecutionTranscriptEvent> => {
+  const events: Array<ExecutionTranscriptEvent> = manifest.transitions.map((transition, index) => ({
+    version: 1 as const,
+    sequence: index + 1,
+    cursor: `cursor-${index + 1}`,
+    timestamp: transition.timestamp,
+    type: "status" as const,
+    jobId: manifest.jobId,
+    status: transition.status,
+  }));
+  if (manifest.outcome !== undefined) {
+    const terminalIndex = events.findIndex(
+      (event) =>
+        event.type === "status" &&
+        (event.status === "succeeded" || event.status === "failed" || event.status === "cancelled"),
+    );
+    const insertAt = terminalIndex === -1 ? events.length : terminalIndex;
+    const outcomeEvent = {
+      version: 1 as const,
+      sequence: insertAt + 1,
+      cursor: `cursor-${insertAt + 1}`,
+      timestamp: manifest.transitions[insertAt]?.timestamp ?? manifest.audit.submittedAt,
+      type: "outcome" as const,
+      jobId: manifest.jobId,
+      outcome: manifest.outcome,
+    };
+    events.splice(insertAt, 0, outcomeEvent);
+  }
+  return events.map((event, index) => ({ ...event, sequence: index + 1, cursor: `cursor-${index + 1}` }));
+};
+
+const replayAfter = (
+  events: ReadonlyArray<ExecutionTranscriptEvent>,
+  cursor: string | undefined,
+) => {
+  if (cursor === undefined) return events;
+  const index = events.findIndex((event) => event.cursor === cursor);
+  return index === -1 ? events : events.slice(index + 1);
+};
 
 const responseFor = (manifest: JobManifest) => ({
   version: 1 as const,
@@ -121,12 +162,13 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
     onExcessProperty: "error",
   })(event);
   if (operation.operation === "transcript") {
-    return yield* Effect.fail(
-      new ManifestPersistenceError({
-        operation: "transcript",
-        message: "Execution Transcript reads are unavailable until execution is enabled",
-      }),
-    );
+    const manifest = yield* controller().handle({ version: 1, operation: "get", jobId: operation.jobId });
+    if ("jobs" in manifest) return yield* Effect.die("Expected Job manifest");
+    return {
+      version: 1 as const,
+      ok: true as const,
+      value: replayAfter(transcriptFor(manifest), operation.cursor),
+    };
   }
 
   const value = yield* controller(

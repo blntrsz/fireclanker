@@ -37,6 +37,7 @@ import {
   verifyAlchemyControlAlias,
 } from "../infrastructure/alchemy-core.js";
 import {
+  ExecutionTranscriptEventSchema,
   JobListPageSchema,
   JobManifestSchema,
   type ControlOperation,
@@ -157,7 +158,15 @@ export const ProductionJobControl = Layer.effect(
           Effect.mapError(preserveJobControlError),
         )),
       cancel: Effect.fn("JobControl.Production.cancel")(invokeManifest),
-      watch: unavailable,
+      watch: Effect.fn("JobControl.Production.watch")((operation, configurationPath) =>
+        invoke(operation, configurationPath).pipe(
+          Effect.flatMap((value) =>
+            Schema.decodeUnknownEffect(Schema.Array(ExecutionTranscriptEventSchema), {
+              onExcessProperty: "error",
+            })(value),
+          ),
+          Effect.mapError(preserveJobControlError),
+        )),
     });
   }),
 );
