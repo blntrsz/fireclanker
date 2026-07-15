@@ -65,8 +65,14 @@ const decodeTranscript = Schema.decodeUnknownSync(Schema.Array(ExecutionTranscri
 const readManifest = (jobId: string) =>
   readPersistedDocument(jobId, manifestPath(jobId), decodeManifest);
 
-const readTranscript = (jobId: string) =>
-  readPersistedDocument(jobId, transcriptPath(jobId), decodeTranscript);
+const readTranscript = (jobId: string, cursor: string | undefined) =>
+  readPersistedDocument(jobId, transcriptPath(jobId), decodeTranscript).pipe(
+    Effect.map((events) => {
+      if (cursor === undefined) return events;
+      const index = events.findIndex((event) => event.cursor === cursor);
+      return index === -1 ? events : events.slice(index + 1);
+    }),
+  );
 
 const DeterministicPi = Layer.succeed(
   Pi,
@@ -252,7 +258,7 @@ const JobControlFromDeterministicServices = Layer.effect(
             yield* Effect.promise(() => Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled)));
             return cancelled;
       }),
-      watch: Effect.fn("JobControl.Deterministic.watch")((operation) => readTranscript(operation.jobId)),
+      watch: Effect.fn("JobControl.Deterministic.watch")((operation) => readTranscript(operation.jobId, operation.cursor)),
     });
   }),
 );
