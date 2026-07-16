@@ -489,6 +489,26 @@ describe("compiled deterministic CLI", () => {
     }
   }, 15_000);
 
+  test("deploy rejects malformed persisted deployment state", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "fireclanker-malformed-state-"));
+    const home = await mkdtemp(join(tmpdir(), "fireclanker-malformed-state-home-"));
+    await Bun.write(join(cwd, "fireclanker.json"), JSON.stringify(configuration("malformed-state")));
+    await Bun.write(
+      join(stateDirectory, "deployments.json"),
+      JSON.stringify({ malformed: { configuration: {}, tokenVersion: "one", controlAlias: "latest" } }),
+    );
+
+    try {
+      const rejected = invokeDeployment(["--json", "deploy", "--yes"], cwd, home);
+
+      expect(rejected.exitCode).toBe(1);
+      expect(rejected.stdout.toString()).toBe("");
+      expect(JSON.parse(rejected.stderr.toString())).toMatchObject({ code: "deployment_failed" });
+    } finally {
+      await rm(join(stateDirectory, "deployments.json"), { force: true });
+    }
+  });
+
   test("deploy converges portably, preserves or rotates the PAT, and destroys only the name", async () => {
     const firstMachine = await mkdtemp(join(tmpdir(), "fireclanker-first-machine-"));
     const secondMachine = await mkdtemp(join(tmpdir(), "fireclanker-second-machine-"));

@@ -107,6 +107,14 @@ describe("multi-repository Publication Plan publication", () => {
 
     expect(failure.message).toBe("Publication Plan repository openai/other is not in the Repository Set");
   });
+
+  test("preserves publisher defects instead of reporting them as typed publication failures", async () => {
+    const execution = Effect.runPromise(publishPublicationPlan(plan, repositorySet, {
+      publish: () => Effect.die(new Error("unexpected publisher defect")),
+    }));
+
+    await expect(execution).rejects.toThrow("unexpected publisher defect");
+  });
 });
 
 const planned = {

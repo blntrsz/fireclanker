@@ -376,10 +376,10 @@ export const planAlchemyStack = async (
     const effect = evalStack(
       stack,
       (compiled) =>
-        Plan.make(
+        Plan.make<unknown>(
           (operation === "destroy"
             ? { ...compiled, resources: {}, bindings: {}, actions: {}, output: {} }
-            : compiled) as any,
+            : compiled),
         ),
       { stage: coreOptions.stage },
     );

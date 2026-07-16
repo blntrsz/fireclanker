@@ -8,6 +8,7 @@ import {
 import {
   DeploymentCore,
   DeploymentOperationFailure,
+  DeploymentUnavailable,
   JobControl,
   JobNotCancellable,
   JobNotFound,
@@ -20,6 +21,7 @@ import {
   deploymentKey,
   deploymentResources,
   deriveDeploymentPlan,
+  supportedRegions,
   type DeploymentConfiguration,
   type DeploymentIdentity,
 } from "../domain/deployment.js";
@@ -61,6 +63,11 @@ const decodeManifest = Schema.decodeUnknownSync(JobManifestSchema, {
 const decodeTranscript = Schema.decodeUnknownSync(Schema.Array(ExecutionTranscriptEventSchema), {
   onExcessProperty: "error",
 });
+
+const deterministicJobControlFailure = (operation: string, error: unknown) =>
+  new DeploymentUnavailable({
+    message: `${operation} failed: ${error instanceof Error ? error.message : String(error)}`,
+  });
 
 const readManifest = (jobId: string) =>
   readPersistedDocument(jobId, manifestPath(jobId), decodeManifest);
@@ -207,7 +214,10 @@ const JobControlFromDeterministicServices = Layer.effect(
 
           Schema.decodeUnknownSync(JobManifestSchema)(manifest);
           Schema.decodeUnknownSync(Schema.Array(ExecutionTranscriptEventSchema))(transcript);
-          yield* Effect.promise(() => mkdir(stateDirectory(), { recursive: true }));
+          yield* Effect.tryPromise({
+            try: () => mkdir(stateDirectory(), { recursive: true }),
+            catch: (error) => deterministicJobControlFailure("Create deterministic state directory", error),
+          });
           if (process.env.FIRECLANKER_TEST_EXECUTION_DISABLED === "1") {
             const { outcome: _outcome, ...accepted } = manifest;
             const initialTransition = manifest.transitions[0];
@@ -220,14 +230,24 @@ const JobControlFromDeterministicServices = Layer.effect(
               transitions: [initialTransition],
               transcript: { highestCursor: null },
             };
-            yield* Effect.promise(() =>
-              Bun.write(manifestPath(jobId), JSON.stringify(queuedManifest)),
-            );
-            yield* Effect.promise(() => Bun.write(transcriptPath(jobId), "[]"));
+            yield* Effect.tryPromise({
+              try: () => Bun.write(manifestPath(jobId), JSON.stringify(queuedManifest)),
+              catch: (error) => deterministicJobControlFailure("Write queued Job manifest", error),
+            });
+            yield* Effect.tryPromise({
+              try: () => Bun.write(transcriptPath(jobId), "[]"),
+              catch: (error) => deterministicJobControlFailure("Write queued Job transcript", error),
+            });
             return queuedManifest;
           }
-          yield* Effect.promise(() => Bun.write(manifestPath(jobId), JSON.stringify(manifest)));
-          yield* Effect.promise(() => Bun.write(transcriptPath(jobId), JSON.stringify(transcript)));
+          yield* Effect.tryPromise({
+            try: () => Bun.write(manifestPath(jobId), JSON.stringify(manifest)),
+            catch: (error) => deterministicJobControlFailure("Write Job manifest", error),
+          });
+          yield* Effect.tryPromise({
+            try: () => Bun.write(transcriptPath(jobId), JSON.stringify(transcript)),
+            catch: (error) => deterministicJobControlFailure("Write Job transcript", error),
+          });
           return manifest;
         }),
       get: Effect.fn("JobControl.Deterministic.get")((operation) => readManifest(operation.jobId)),
@@ -250,12 +270,23 @@ const JobControlFromDeterministicServices = Layer.effect(
       }),
       cancel: Effect.fn("JobControl.Deterministic.cancel")(function* (operation) {
             const file = Bun.file(manifestPath(operation.jobId));
-            if (!(yield* Effect.promise(() => file.exists()))) {
+            const exists = yield* Effect.tryPromise({
+              try: () => file.exists(),
+              catch: (error) => deterministicJobControlFailure("Check Job manifest", error),
+            });
+            if (!exists) {
               return yield* Effect.fail(new JobNotFound({ jobId: operation.jobId }));
             }
-            const manifest = decodeManifest(yield* Effect.promise(() => file.json()));
+            const input = yield* Effect.tryPromise({
+              try: () => file.json(),
+              catch: (error) => deterministicJobControlFailure("Read Job manifest", error),
+            });
+            const manifest = decodeManifest(input);
             const cancelled = yield* cancelJobManifest(manifest, new Date().toISOString());
-            yield* Effect.promise(() => Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled)));
+            yield* Effect.tryPromise({
+              try: () => Bun.write(manifestPath(operation.jobId), JSON.stringify(cancelled)),
+              catch: (error) => deterministicJobControlFailure("Write cancelled Job manifest", error),
+            });
             return cancelled;
       }),
       watch: Effect.fn("JobControl.Deterministic.watch")((operation) => readTranscript(operation.jobId, operation.cursor)),
@@ -267,19 +298,32 @@ export const DeterministicJobControl = JobControlFromDeterministicServices.pipe(
   Layer.provide([DeterministicPi, DeterministicTime]),
 );
 
-interface PersistedDeployment {
-  readonly configuration: DeploymentConfiguration;
-  readonly tokenVersion: number;
-  readonly controlAlias: "live";
-}
+const PersistedDeploymentSchema = Schema.Struct({
+  configuration: Schema.Struct({
+    version: Schema.Literal(1),
+    name: Schema.String,
+    region: Schema.Literals(supportedRegions),
+    model: Schema.Literals(["gpt-5.5", "claude-sonnet-5", "claude-opus-4.8"]),
+    repositoryCatalog: Schema.Array(Schema.String),
+    retentionDays: Schema.Int.check(Schema.isGreaterThan(0)),
+  }),
+  tokenVersion: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  controlAlias: Schema.Literal("live"),
+});
 
+interface PersistedDeployment extends Schema.Schema.Type<typeof PersistedDeploymentSchema> {}
+
+const DeploymentStateSchema = Schema.Record(Schema.String, PersistedDeploymentSchema);
 type DeploymentState = Record<string, PersistedDeployment>;
+const decodeDeploymentState = Schema.decodeUnknownSync(DeploymentStateSchema, {
+  onExcessProperty: "error",
+});
 
 const deploymentStatePath = () => join(stateDirectory(), "deployments.json");
 
 const readDeploymentState = async (): Promise<DeploymentState> => {
   const file = Bun.file(deploymentStatePath());
-  return (await file.exists()) ? ((await file.json()) as DeploymentState) : {};
+  return (await file.exists()) ? { ...decodeDeploymentState(await file.json()) } : {};
 };
 
 const writeDeploymentState = async (state: DeploymentState) => {
@@ -299,14 +343,14 @@ const deploymentFailure = (error: unknown) =>
 
 export const DeterministicDeploymentCore = Layer.effect(
   DeploymentCore,
-  Effect.succeed({
-    resolveIdentity: (configuration: DeploymentConfiguration) =>
+  Effect.succeed(DeploymentCore.of({
+    resolveIdentity: Effect.fn("DeploymentCore.Deterministic.resolveIdentity")((configuration: DeploymentConfiguration) =>
       Effect.succeed({
         accountId: "123456789012",
         region: configuration.region,
         name: configuration.name,
-      }),
-    plan: (operation, identity, configuration, rotateGitHubToken) =>
+      })),
+    plan: Effect.fn("DeploymentCore.Deterministic.plan")((operation, identity, configuration, rotateGitHubToken) =>
       Effect.tryPromise({
         try: async () => {
           const state = await readDeploymentState();
@@ -329,8 +373,8 @@ export const DeterministicDeploymentCore = Layer.effect(
           } as const;
         },
         catch: deploymentFailure,
-      }),
-    apply: (plan, configuration, githubToken) =>
+      })),
+    apply: Effect.fn("DeploymentCore.Deterministic.apply")((plan, configuration, githubToken) =>
       Effect.tryPromise({
         try: async () => {
           const state = await readDeploymentState();
@@ -350,8 +394,8 @@ export const DeterministicDeploymentCore = Layer.effect(
           return { tokenVersion };
         },
         catch: deploymentFailure,
-      }),
-    destroy: (plan) =>
+      })),
+    destroy: Effect.fn("DeploymentCore.Deterministic.destroy")((plan) =>
       Effect.tryPromise({
         try: async () => {
           const state = await readDeploymentState();
@@ -359,8 +403,8 @@ export const DeterministicDeploymentCore = Layer.effect(
           await writeDeploymentState(state);
         },
         catch: deploymentFailure,
-      }),
-    verifyControlAlias: (identity: DeploymentIdentity) =>
+      })),
+    verifyControlAlias: Effect.fn("DeploymentCore.Deterministic.verifyControlAlias")((identity: DeploymentIdentity) =>
       Effect.tryPromise({
         try: async () => {
           const state = await readDeploymentState();
@@ -369,6 +413,6 @@ export const DeterministicDeploymentCore = Layer.effect(
           }
         },
         catch: deploymentFailure,
-      }),
-  }),
+      })),
+  })),
 );

@@ -194,8 +194,8 @@ export const ProductionDeploymentCore = Layer.effect(
   Effect.sync(() => {
     const plannedConfigurations = new Map<string, DeploymentConfiguration>();
     const plannedCredentials = new Map<string, AmbientCredentials>();
-    return {
-      resolveIdentity: (configuration: DeploymentConfiguration) =>
+    return DeploymentCore.of({
+      resolveIdentity: Effect.fn("DeploymentCore.Production.resolveIdentity")((configuration: DeploymentConfiguration) =>
         Effect.tryPromise({
           try: async () => {
             const resolved = await defaultProvider()();
@@ -220,8 +220,8 @@ export const ProductionDeploymentCore = Layer.effect(
             return deploymentIdentity;
           },
           catch: deploymentFailure,
-        }),
-      plan: (operation, identity, configuration, rotateGitHubToken) =>
+        })),
+      plan: Effect.fn("DeploymentCore.Production.plan")((operation, identity, configuration, rotateGitHubToken) =>
         Effect.tryPromise({
           try: async () => {
             plannedConfigurations.set(deploymentKey(identity), configuration);
@@ -364,8 +364,8 @@ export const ProductionDeploymentCore = Layer.effect(
             } as const;
           },
           catch: deploymentFailure,
-        }),
-      apply: (plan, configuration, githubToken) =>
+        })),
+      apply: Effect.fn("DeploymentCore.Production.apply")((plan, configuration, githubToken) =>
         Effect.tryPromise({
           try: async () => {
             const credentials = plannedCredentials.get(deploymentKey(plan.identity));
@@ -376,8 +376,8 @@ export const ProductionDeploymentCore = Layer.effect(
             return { tokenVersion: githubToken === undefined ? 0 : 1 };
           },
           catch: deploymentFailure,
-        }),
-      destroy: (plan) =>
+        })),
+      destroy: Effect.fn("DeploymentCore.Production.destroy")((plan) =>
         Effect.tryPromise({
           try: async () => {
             const configuration = plannedConfigurations.get(deploymentKey(plan.identity));
@@ -389,8 +389,8 @@ export const ProductionDeploymentCore = Layer.effect(
             }
           },
           catch: deploymentFailure,
-        }),
-      verifyControlAlias: (identity: DeploymentIdentity) =>
+        })),
+      verifyControlAlias: Effect.fn("DeploymentCore.Production.verifyControlAlias")((identity: DeploymentIdentity) =>
         Effect.tryPromise({
           try: () => {
             const credentials = plannedCredentials.get(deploymentKey(identity));
@@ -398,8 +398,8 @@ export const ProductionDeploymentCore = Layer.effect(
             return verifyAlchemyControlAlias(identity, credentials);
           },
           catch: deploymentFailure,
-        }),
-    };
+        })),
+    });
   }),
 );
 import { GetRolePolicyCommand, IAMClient, NoSuchEntityException } from "@aws-sdk/client-iam";

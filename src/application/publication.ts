@@ -1,4 +1,4 @@
-import { Cause, Effect, Exit, Result, Schema } from "effect";
+import { Effect, Result, Schema } from "effect";
 import {
   ChangeSetOutcomeSchema,
   PublicationFailureSchema,
@@ -88,12 +88,11 @@ const pullRequestIdentity = (pullRequest: PullRequest) =>
 const publicationError = (operation: string, message: string) =>
   new ManifestPersistenceError({ operation, message });
 
-export const publishSafeRepository = (
+export const publishSafeRepository = Effect.fn("Publication.publishSafeRepository")(function* (
   entry: PublicationPlan["repositories"][number],
   order: number,
   publisher: SafeRepositoryPublisher,
-): Effect.Effect<RepositoryPublication, ManifestPersistenceError> =>
-  Effect.gen(function* () {
+): Effect.fn.Return<RepositoryPublication, ManifestPersistenceError> {
     const initialRebase = yield* publisher.rebase(entry, order);
     const rebase = initialRebase.kind === "conflict"
       ? yield* publisher.resolveConflict(entry, order, initialRebase)
@@ -134,7 +133,7 @@ export const publishSafeRepository = (
       "publish.reconcile",
       `Ambiguous publication for ${entry.repository} could not be reconciled: ${firstWrite.message}`,
     );
-  });
+});
 
 export interface RepositoryPublisher {
   readonly publish: (
@@ -151,11 +150,10 @@ export interface PublicationResult {
 
 const unique = (values: ReadonlyArray<string>) => new Set(values).size === values.length;
 
-export const validatePublicationPlanOrder = (
+export const validatePublicationPlanOrder = Effect.fn("Publication.validatePlanOrder")(function* (
   plan: PublicationPlan,
   repositorySet: ReadonlyArray<RepositorySetMember>,
-): Effect.Effect<PublicationPlan, InvalidUsage> =>
-  Effect.gen(function* () {
+): Effect.fn.Return<PublicationPlan, InvalidUsage> {
     const planned = plan.repositories.map((entry) => entry.repository);
     if (!unique(planned)) {
       return yield* new InvalidUsage({ message: "Publication Plan contains duplicate repositories" });
@@ -168,14 +166,13 @@ export const validatePublicationPlanOrder = (
       });
     }
     return plan;
-  });
+});
 
-export const publishPublicationPlan = (
+export const publishPublicationPlan = Effect.fn("Publication.publishPlan")(function* (
   rawPlan: PublicationPlan,
   repositorySet: ReadonlyArray<RepositorySetMember>,
   publisher: RepositoryPublisher,
-): Effect.Effect<PublicationResult, InvalidUsage> =>
-  Effect.gen(function* () {
+): Effect.fn.Return<PublicationResult, InvalidUsage> {
     const plan = yield* validatePublicationPlanOrder(rawPlan, repositorySet);
     const journal: PublicationJournalEntry[] = plan.repositories.map((entry, order) => ({
       repository: entry.repository,
@@ -185,12 +182,9 @@ export const publishPublicationPlan = (
     const retained: RepositoryPublication[] = [];
 
     for (const [order, entry] of plan.repositories.entries()) {
-      const published = yield* Effect.exit(publisher.publish(entry, order));
-      if (Exit.isFailure(published)) {
-        const error = Result.getOrUndefined(Cause.findError(published.cause)) ?? new ManifestPersistenceError({
-          operation: "publish",
-          message: "Repository publication failed",
-        });
+      const published = yield* Effect.result(publisher.publish(entry, order));
+      if (Result.isFailure(published)) {
+        const error = published.failure;
         journal[order] = {
           repository: entry.repository,
           order,
@@ -216,18 +210,18 @@ export const publishPublicationPlan = (
         });
         return { failure, journal };
       }
-      retained.push(published.value);
+      retained.push(published.success);
       journal[order] = {
         repository: entry.repository,
         order,
         phase: "pull-request-retained",
-        branch: published.value.branch,
-        commit: published.value.commit,
-        baseSha: published.value.baseSha,
-        expectedHeadSha: published.value.expectedHeadSha,
-        deterministicBranch: published.value.deterministicBranch,
-        pullRequest: published.value.pullRequest,
-        pullRequestIdentity: pullRequestIdentity(published.value.pullRequest),
+        branch: published.success.branch,
+        commit: published.success.commit,
+        baseSha: published.success.baseSha,
+        expectedHeadSha: published.success.expectedHeadSha,
+        deterministicBranch: published.success.deterministicBranch,
+        pullRequest: published.success.pullRequest,
+        pullRequestIdentity: pullRequestIdentity(published.success.pullRequest),
       };
     }
 
@@ -238,7 +232,7 @@ export const publishPublicationPlan = (
       pullRequests: retained.map(({ pullRequest }) => pullRequest),
     });
     return { outcome, journal };
-  });
+});
 
 export const decodePublicationPlan = (input: unknown) =>
   Schema.decodeUnknownEffect(PublicationPlanSchema, { onExcessProperty: "error" })(input);
