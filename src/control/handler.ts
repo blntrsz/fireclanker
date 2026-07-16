@@ -2,6 +2,7 @@ import { InvokeCommand, LambdaClient } from "@aws-sdk/client-lambda";
 import { createHash } from "node:crypto";
 import { Config, Effect, Schema } from "effect";
 import { makeJobController } from "../application/job-controller.js";
+import { environmentSecretRedactionBoundary } from "../application/redaction.js";
 import {
   InvalidCursor,
   JobIdempotencyConflict,
@@ -17,6 +18,8 @@ interface LambdaContext {
   readonly invokedFunctionArn: string;
 }
 
+const redaction = environmentSecretRedactionBoundary();
+
 const errorCode = (error: unknown) => {
   if (error instanceof JobIdempotencyConflict) return "idempotency_conflict";
   if (error instanceof InvalidCursor) return "invalid_cursor";
@@ -26,7 +29,7 @@ const errorCode = (error: unknown) => {
   return "control_operation_failed";
 };
 
-const failureEnvelope = (error: unknown) => ({
+const failureEnvelope = (error: unknown) => redaction.redactValue({
   version: 1 as const,
   ok: false as const,
   error: {
@@ -192,11 +195,11 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
   if (operation.operation === "transcript") {
     const manifest = yield* controller().handle({ version: 1, operation: "get", jobId: operation.jobId });
     if ("jobs" in manifest) return yield* Effect.die("Expected Job manifest");
-    return {
+    return redaction.redactValue({
       version: 1 as const,
       ok: true as const,
       value: replayAfter(transcriptFor(manifest), operation.cursor),
-    };
+    });
   }
 
   const value = yield* controller(
@@ -204,7 +207,7 @@ const handle = Effect.fn("ControlLambda.handle")(function* (
       ? operation.submittedBy
       : context.invokedFunctionArn,
   ).handle(operation);
-  return { version: 1 as const, ok: true as const, value };
+  return redaction.redactValue({ version: 1 as const, ok: true as const, value });
 });
 
 export const handler = (event: unknown, context: LambdaContext) =>

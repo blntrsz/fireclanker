@@ -7,6 +7,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { Effect, Schema } from "effect";
 import type { ManifestStoreService, StoredManifest } from "../application/job-controller.js";
+import { environmentSecretRedactionBoundary } from "../application/redaction.js";
 import { ManifestPersistenceError } from "../application/services.js";
 import { JobManifestSchema, type JobManifest } from "../domain/schemas.js";
 
@@ -39,6 +40,7 @@ const manifestKey = (manifest: JobManifest) => {
 export class S3ManifestStore implements ManifestStoreService {
   readonly #client: S3Client;
   readonly #keys = new Map<string, string>();
+  readonly #redaction = environmentSecretRedactionBoundary();
 
   constructor(
     readonly bucket: string,
@@ -103,14 +105,19 @@ export class S3ManifestStore implements ManifestStoreService {
   });
 
   readonly create = Effect.fn("ManifestStore.S3.create")((manifest: JobManifest) => {
-    const key = manifestKey(manifest);
+    const redactedManifest = this.#redaction.redactValue(manifest);
+    const key = manifestKey(redactedManifest);
+    const body = JSON.stringify(redactedManifest);
+    if (this.#redaction.isRegisteredSecretPresent(body)) {
+      return Effect.fail(persistenceError("create.redaction", "Registered secret remained after manifest redaction"));
+    }
     return Effect.tryPromise({
       try: () =>
         this.#client.send(
           new PutObjectCommand({
             Bucket: this.bucket,
             Key: key,
-            Body: JSON.stringify(manifest),
+            Body: body,
             ContentType: "application/json",
             IfNoneMatch: "*",
           }),
@@ -119,7 +126,7 @@ export class S3ManifestStore implements ManifestStoreService {
     }).pipe(
       Effect.map((result) => {
         this.#keys.set(manifest.jobId, key);
-        return { manifest, etag: result.ETag ?? '"created"' } satisfies StoredManifest;
+        return { manifest: redactedManifest, etag: result.ETag ?? '"created"' } satisfies StoredManifest;
       }),
       Effect.catch((cause) =>
         metadataStatus(cause) === 412 || errorName(cause) === "PreconditionFailed"
@@ -147,6 +154,11 @@ export class S3ManifestStore implements ManifestStoreService {
     expectedEtag: string,
     manifest: JobManifest,
   ) {
+    const redactedManifest = this.#redaction.redactValue(manifest);
+    const body = JSON.stringify(redactedManifest);
+    if (this.#redaction.isRegisteredSecretPresent(body)) {
+      return yield* Effect.fail(persistenceError("replace.redaction", "Registered secret remained after manifest redaction"));
+    }
     const existing = yield* this.read(jobId);
     if (existing === undefined) return undefined;
     const key = this.#keys.get(jobId);
@@ -157,14 +169,14 @@ export class S3ManifestStore implements ManifestStoreService {
           new PutObjectCommand({
             Bucket: this.bucket,
             Key: key,
-            Body: JSON.stringify(manifest),
+            Body: body,
             ContentType: "application/json",
             IfMatch: expectedEtag,
           }),
         ),
       catch: (cause) => cause,
     }).pipe(
-      Effect.map((result) => ({ manifest, etag: result.ETag ?? expectedEtag })),
+      Effect.map((result) => ({ manifest: redactedManifest, etag: result.ETag ?? expectedEtag })),
       Effect.catch((cause) =>
         metadataStatus(cause) === 412 || errorName(cause) === "PreconditionFailed"
           ? Effect.succeed(undefined)

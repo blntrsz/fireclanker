@@ -13,6 +13,7 @@ import {
   type JobControlService,
   TerminalInteraction,
 } from "./application/services.js";
+import { environmentSecretRedactionBoundary } from "./application/redaction.js";
 import {
   DeterministicDeploymentCore,
   DeterministicJobControl,
@@ -41,6 +42,7 @@ import {
 
 declare const FIRECLANKER_COMPOSITION: "production" | "test";
 
+const redaction = environmentSecretRedactionBoundary();
 const rootCommand = Command.make("fireclanker").pipe(
   Command.withSharedFlags({
     json: Flag.boolean("json"),
@@ -48,7 +50,7 @@ const rootCommand = Command.make("fireclanker").pipe(
   }),
 );
 
-const jsonLine = (event: CliEvent): string => JSON.stringify(CliEventSchema.make(event));
+const jsonLine = (event: CliEvent): string => redaction.redactText(JSON.stringify(CliEventSchema.make(redaction.redactValue(event))));
 const decodeOperation = <A, I, R>(schema: Schema.Codec<A, I, R>, input: unknown, message: string) =>
   Schema.decodeUnknownEffect(schema, {
     onExcessProperty: "error",
@@ -235,6 +237,7 @@ const run = Command.make(
 );
 
 const renderTranscriptEvent = (event: ExecutionTranscriptEvent): string => {
+  event = redaction.redactValue(event);
   if (event.type === "status") {
     return `[${event.timestamp}] Job ${event.jobId} ${event.status}`;
   }
@@ -320,7 +323,7 @@ const get = Command.make(
         },
         `Invalid Job ID: ${jobId}`,
       );
-      const manifest = yield* control.get(operation, Option.getOrUndefined(globals.config));
+      const manifest = redaction.redactValue(yield* control.get(operation, Option.getOrUndefined(globals.config)));
       if (globals.json) {
         yield* Console.log(
           jsonLine({
@@ -404,7 +407,7 @@ const list = Command.make(
         },
         "Invalid Job list arguments",
       );
-      const page = yield* control.list(operation, Option.getOrUndefined(globals.config));
+      const page = redaction.redactValue(yield* control.list(operation, Option.getOrUndefined(globals.config)));
       if (globals.json) {
         yield* Console.log(
           jsonLine({
@@ -617,12 +620,13 @@ const program = commandProgram.pipe(
                     : tag === "DeploymentOperationFailure"
                       ? "deployment_failed"
                       : "command_failed";
-      const message =
+      const message = redaction.redactText(
         (tag === "JobNotFound" || tag === "JobNotCancellable") && "jobId" in tagged
           ? tag === "JobNotFound"
             ? `Job ${String(tagged.jobId)} not found`
             : `Job ${String(tagged.jobId)} is not cancellable`
-          : taggedMessage || "Command failed";
+          : taggedMessage || "Command failed",
+      );
       process.stderr.write(
         jsonRequested
           ? `${jsonLine({ version: 1, event: "error", code, message })}\n`

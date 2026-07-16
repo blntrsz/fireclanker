@@ -30,7 +30,7 @@ export interface AmbientCredentials {
 
 declare const FIRECLANKER_CONTROL_HANDLER: string;
 
-const controlHandler = FIRECLANKER_CONTROL_HANDLER;
+const controlHandler = typeof FIRECLANKER_CONTROL_HANDLER === "undefined" ? "export const handler = () => undefined;" : FIRECLANKER_CONTROL_HANDLER;
 
 const runtimeDockerfile = `FROM public.ecr.aws/lambda/microvms:al2023-minimal
 RUN dnf install -y python3 && dnf clean all
@@ -97,6 +97,35 @@ const lambdaTrust: AWS.IAM.PolicyDocument = {
   ],
 };
 
+
+export const buildPolicyDocument = (identity: DeploymentIdentity) => {
+  const bootstrapBucket = bootstrapBucketName(identity);
+  const prefix = `deployments/${identity.name}`;
+  return {
+    Version: "2012-10-17",
+    Statement: [
+      { Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${bootstrapBucket}/${prefix}/assets/*`] },
+      { Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: [`arn:aws:logs:${identity.region}:${identity.accountId}:log-group:/fireclanker/${identity.name}/build:*`] },
+    ],
+  } satisfies AWS.IAM.PolicyDocument;
+};
+
+export const runnerPolicyDocument = (identity: DeploymentIdentity) => {
+  const dataBucket = dataBucketName(identity);
+  const secretName = githubSecretName(identity);
+  return {
+    Version: "2012-10-17",
+    Statement: [
+      { Effect: "Allow", Action: ["s3:ListBucket"], Resource: [`arn:aws:s3:::${dataBucket}`], Condition: { StringLike: { "s3:prefix": ["jobs/*"] } } },
+      { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject"], Resource: [`arn:aws:s3:::${dataBucket}/jobs/*`] },
+      { Effect: "Allow", Action: ["secretsmanager:GetSecretValue"], Resource: [`arn:aws:secretsmanager:${identity.region}:${identity.accountId}:secret:${secretName}*`] },
+      { Effect: "Allow", Action: ["lambda:InvokeFunction"], Resource: [`arn:aws:lambda:${identity.region}:${identity.accountId}:function:fireclanker-${identity.name}-control:live`] },
+      { Effect: "Allow", Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], Resource: ["*"] },
+      { Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: [`arn:aws:logs:${identity.region}:${identity.accountId}:log-group:/fireclanker/${identity.name}/runner:*`] },
+    ],
+  } satisfies AWS.IAM.PolicyDocument;
+};
+
 const createStack = (
   configuration: DeploymentConfiguration,
   identity: DeploymentIdentity,
@@ -151,32 +180,13 @@ const createStack = (
       const buildRole = yield* AWS.IAM.Role("BuildRole", {
         roleName: `fireclanker-${identity.name}-build`,
         assumeRolePolicyDocument: lambdaTrust,
-        inlinePolicies: {
-          assets: {
-            Version: "2012-10-17",
-            Statement: [
-              { Effect: "Allow", Action: ["s3:GetObject"], Resource: [`arn:aws:s3:::${bootstrapBucket}/${prefix}/assets/*`] },
-              { Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: [`arn:aws:logs:${identity.region}:${identity.accountId}:log-group:/fireclanker/${identity.name}/build:*`] },
-            ],
-          },
-        },
+        inlinePolicies: { assets: buildPolicyDocument(identity) },
       });
 
       yield* AWS.IAM.Role("RunnerRole", {
         roleName: `fireclanker-${identity.name}-runner`,
         assumeRolePolicyDocument: lambdaTrust,
-        inlinePolicies: {
-          runtime: {
-            Version: "2012-10-17",
-            Statement: [
-              { Effect: "Allow", Action: ["s3:GetObject", "s3:PutObject", "s3:ListBucket"], Resource: [`arn:aws:s3:::${dataBucket}`, `arn:aws:s3:::${dataBucket}/jobs/*`] },
-              { Effect: "Allow", Action: ["secretsmanager:GetSecretValue"], Resource: [`arn:aws:secretsmanager:${identity.region}:${identity.accountId}:secret:${secretName}*`] },
-              { Effect: "Allow", Action: ["lambda:InvokeFunction"], Resource: [`arn:aws:lambda:${identity.region}:${identity.accountId}:function:fireclanker-${identity.name}-control:live`] },
-              { Effect: "Allow", Action: ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], Resource: ["*"] },
-              { Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: [`arn:aws:logs:${identity.region}:${identity.accountId}:log-group:/fireclanker/${identity.name}/runner:*`] },
-            ],
-          },
-        },
+        inlinePolicies: { runtime: runnerPolicyDocument(identity) },
       });
 
       yield* AWS.SecretsManager.Secret("GitHubPat", {
